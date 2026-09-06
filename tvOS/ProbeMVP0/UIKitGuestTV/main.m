@@ -1,11 +1,19 @@
 #import <UIKit/UIKit.h>
 #import <TargetConditionals.h>
 #import <mach-o/dyld.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <objc/runtime.h>
+#import <dlfcn.h>
 #import <limits.h>
 #import <stdlib.h>
 
 static NSString * const LCTVLastMVP3ResultKey = @"LCTVLastMVP3Result";
 static NSString * const LCTVLastMVP3IdentityKey = @"LCTVLastMVP3Identity";
+static NSString * const LCTVExpectedGuestBundleID = @"dev.livecontainertv.uikitguest.patched";
+
+static NSBundle *gLCTVVirtualMainBundle = nil;
+static IMP gLCTVOriginalMainBundleIMP = NULL;
+static NSString *gLCTVMVP4AStatus = nil;
 
 __attribute__((visibility("default")))
 const char *LCTVUIKitGuestMarker(void) {
@@ -25,10 +33,98 @@ static NSString *LCTVCurrentExecutablePath(void) {
     return [NSString stringWithFormat:@"(buffer too small; required=%u)", size];
 }
 
+static NSString *LCTVGuestFrameworkPath(void) {
+    Dl_info imageInfo = {0};
+    if (dladdr((const void *)&LCTVUIKitGuestMarker, &imageInfo) == 0 || !imageInfo.dli_fname) {
+        return nil;
+    }
+    NSString *imagePath = [NSString stringWithUTF8String:imageInfo.dli_fname];
+    return imagePath.stringByDeletingLastPathComponent;
+}
+
+static NSBundle *LCTVMainBundleOverride(id self, SEL _cmd) {
+    if (gLCTVVirtualMainBundle) {
+        return gLCTVVirtualMainBundle;
+    }
+    if (gLCTVOriginalMainBundleIMP) {
+        NSBundle *(*original)(id, SEL) = (NSBundle *(*)(id, SEL))gLCTVOriginalMainBundleIMP;
+        return original(self, _cmd);
+    }
+    return nil;
+}
+
+static BOOL LCTVInstallMainBundleOverride(NSString **errorOut) {
+    NSString *frameworkPath = LCTVGuestFrameworkPath();
+    if (!frameworkPath) {
+        if (errorOut) {
+            *errorOut = @"dladdr could not locate UIKitGuestTV.framework";
+        }
+        return NO;
+    }
+
+    NSBundle *guestBundle = [NSBundle bundleWithPath:frameworkPath];
+    if (!guestBundle) {
+        if (errorOut) {
+            *errorOut = [NSString stringWithFormat:@"NSBundle could not open guest framework at %@", frameworkPath];
+        }
+        return NO;
+    }
+
+    Method method = class_getClassMethod(NSBundle.class, @selector(mainBundle));
+    if (!method) {
+        if (errorOut) {
+            *errorOut = @"+[NSBundle mainBundle] method not found";
+        }
+        return NO;
+    }
+
+    gLCTVVirtualMainBundle = guestBundle;
+    if (!gLCTVOriginalMainBundleIMP) {
+        gLCTVOriginalMainBundleIMP = method_setImplementation(method, (IMP)LCTVMainBundleOverride);
+    } else {
+        method_setImplementation(method, (IMP)LCTVMainBundleOverride);
+    }
+
+    NSBundle *observed = NSBundle.mainBundle;
+    if (observed != guestBundle || ![observed.bundleIdentifier isEqualToString:LCTVExpectedGuestBundleID]) {
+        if (errorOut) {
+            *errorOut = [NSString stringWithFormat:@"override installed but observed bundle is %@ at %@",
+                         observed.bundleIdentifier ?: @"(nil)", observed.bundlePath ?: @"(nil)"];
+        }
+        return NO;
+    }
+    return YES;
+}
+
+static NSString *LCTVCFMainBundleIdentifier(void) {
+    CFBundleRef bundle = CFBundleGetMainBundle();
+    if (!bundle) {
+        return @"(nil)";
+    }
+    CFStringRef identifier = CFBundleGetIdentifier(bundle);
+    return identifier ? [(__bridge NSString *)identifier copy] : @"(nil)";
+}
+
+static NSString *LCTVCFMainBundlePath(void) {
+    CFBundleRef bundle = CFBundleGetMainBundle();
+    if (!bundle) {
+        return @"(nil)";
+    }
+    CFURLRef url = CFBundleCopyBundleURL(bundle);
+    if (!url) {
+        return @"(nil)";
+    }
+    NSString *path = [(__bridge NSURL *)url path] ?: @"(nil)";
+    CFRelease(url);
+    return path;
+}
+
 static NSString *LCTVIdentitySnapshot(void) {
     NSBundle *mainBundle = NSBundle.mainBundle;
     NSString *bundleID = mainBundle.bundleIdentifier ?: @"(nil)";
     NSString *bundlePath = mainBundle.bundlePath ?: @"(nil)";
+    NSString *cfBundleID = LCTVCFMainBundleIdentifier();
+    NSString *cfBundlePath = LCTVCFMainBundlePath();
     NSString *executablePath = LCTVCurrentExecutablePath();
     const char *homeEnv = getenv("HOME");
     NSString *home = homeEnv ? ([NSString stringWithUTF8String:homeEnv] ?: @"(invalid UTF-8)") : @"(unset)";
@@ -36,14 +132,18 @@ static NSString *LCTVIdentitySnapshot(void) {
     NSString *processName = NSProcessInfo.processInfo.processName ?: @"(nil)";
 
     return [NSString stringWithFormat:
-            @"bundleID=%@\n"
-             "bundlePath=%@\n"
+            @"NSBundle.mainBundle.bundleID=%@\n"
+             "NSBundle.mainBundle.bundlePath=%@\n"
+             "CFBundleGetMainBundle.bundleID=%@\n"
+             "CFBundleGetMainBundle.bundlePath=%@\n"
              "_NSGetExecutablePath=%@\n"
              "HOME=%@\n"
              "NSHomeDirectory=%@\n"
              "processName=%@",
             bundleID,
             bundlePath,
+            cfBundleID,
+            cfBundlePath,
             executablePath,
             home,
             nsHome,
@@ -56,11 +156,13 @@ static NSString *LCTVIdentitySnapshot(void) {
 @implementation LCTVUIKitGuestViewController
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = UIColor.systemGreenColor;
+
+    BOOL bundleVirtualized = [NSBundle.mainBundle.bundleIdentifier isEqualToString:LCTVExpectedGuestBundleID];
+    self.view.backgroundColor = bundleVirtualized ? UIColor.systemGreenColor : UIColor.systemRedColor;
 
     UILabel *title = [[UILabel alloc] init];
     title.translatesAutoresizingMaskIntoConstraints = NO;
-    title.text = @"MVP3 PASS";
+    title.text = bundleVirtualized ? @"MVP4A PASS" : @"MVP4A FAIL";
     title.textColor = UIColor.blackColor;
     title.font = [UIFont boldSystemFontOfSize:68.0];
     title.textAlignment = NSTextAlignmentCenter;
@@ -68,26 +170,29 @@ static NSString *LCTVIdentitySnapshot(void) {
 
     UILabel *detail = [[UILabel alloc] init];
     detail.translatesAutoresizingMaskIntoConstraints = NO;
-    NSString *identity = [NSUserDefaults.standardUserDefaults stringForKey:LCTVLastMVP3IdentityKey] ?: LCTVIdentitySnapshot();
+    NSString *identity = LCTVIdentitySnapshot();
     detail.text = [NSString stringWithFormat:
-                   @"Guest UIApplicationMain + AppDelegate are running\n\n"
-                    "MVP4 baseline identity (virtualization NOT applied):\n%@\n\n"
+                   @"Guest UIApplicationMain + AppDelegate are running\n"
+                    "NSBundle virtualization: %@\n\n"
+                    "MVP4A identity snapshot:\n%@\n\n"
+                    "Expected: NSBundle points to UIKitGuestTV.framework. CFBundle, executable path, HOME and process name are intentionally not hooked yet.\n\n"
                     "Force-close LiveContainerTV and reopen it to return to the host probes.",
+                   gLCTVMVP4AStatus ?: @"(no status)",
                    identity];
     detail.textColor = UIColor.blackColor;
-    detail.font = [UIFont monospacedSystemFontOfSize:21.0 weight:UIFontWeightRegular];
+    detail.font = [UIFont monospacedSystemFontOfSize:19.0 weight:UIFontWeightRegular];
     detail.textAlignment = NSTextAlignmentLeft;
     detail.numberOfLines = 0;
     [self.view addSubview:detail];
 
     [NSLayoutConstraint activateConstraints:@[
         [title.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:55],
+        [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:45],
         [detail.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [detail.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:34],
-        [detail.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.leadingAnchor constant:80],
-        [detail.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.trailingAnchor constant:-80],
-        [detail.bottomAnchor constraintLessThanOrEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-45]
+        [detail.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:26],
+        [detail.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.leadingAnchor constant:70],
+        [detail.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.trailingAnchor constant:-70],
+        [detail.bottomAnchor constraintLessThanOrEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-35]
     ]];
 }
 @end
@@ -101,8 +206,15 @@ static NSString *LCTVIdentitySnapshot(void) {
     (void)application;
     (void)launchOptions;
 
+    NSString *overrideError = nil;
+    BOOL overrideOK = LCTVInstallMainBundleOverride(&overrideError);
+    gLCTVMVP4AStatus = overrideOK ? @"PASS: +[NSBundle mainBundle] now returns UIKitGuestTV.framework"
+                                 : [NSString stringWithFormat:@"FAIL: %@", overrideError ?: @"unknown override error"];
+
     NSString *identity = LCTVIdentitySnapshot();
-    NSString *result = @"PASS MVP3: guest UIApplicationMain reached didFinishLaunching";
+    NSString *result = overrideOK ? @"PASS MVP4A: NSBundle mainBundle virtualized"
+                                  : @"FAIL MVP4A: NSBundle mainBundle override failed";
+
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults setObject:result forKey:LCTVLastMVP3ResultKey];
     [defaults setObject:identity forKey:LCTVLastMVP3IdentityKey];
