@@ -50,3 +50,18 @@ targets:
         TARGETED_DEVICE_FAMILY: "3"
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
         SUPPORTS_MACCATALYST: NO
+
+  TinyGuestTV:
+    type: application
+    platform: tvOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: TinyGuestTV
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.livecontainertv.tinyguest
+        PRODUCT_NAME: TinyGuestTV
+        INFOPLIST_FILE: TinyGuestTV/Info.plist
+        TARGETED_DEVICE_FAMILY: "3"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        SUPPORTS_MACCATALYST: NO

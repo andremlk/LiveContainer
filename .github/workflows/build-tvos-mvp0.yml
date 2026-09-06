@@ -1,4 +1,4 @@
-name: Build tvOS MVP0
+name: Build tvOS Prototype
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ jobs:
         working-directory: tvOS/ProbeMVP0
         run: xcodegen generate
 
-      - name: Build unsigned tvOS app
+      - name: Build unsigned tvOS host
         working-directory: tvOS/ProbeMVP0
         run: |
           set -o pipefail
@@ -40,7 +40,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build | tee xcodebuild.log
 
-      - name: Verify embedded payload
+      - name: Verify embedded MVP0 payload
         working-directory: tvOS/ProbeMVP0
         run: |
           APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
@@ -52,11 +52,48 @@ jobs:
           otool -hv "$PAYLOAD"
           otool -L "$APP/LiveContainerTV"
 
-      - name: Package IPA
+      - name: Build TinyGuestTV executable
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme TinyGuestTV \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-guest \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee xcodebuild-guest.log
+
+      - name: Build MVP1 Mach-O patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          mkdir -p build-tools
+          xcrun clang -std=c11 -Wall -Wextra -Werror \
+            Tools/lctv_macho_patch.c \
+            -o build-tools/lctv_macho_patch
+
+      - name: Patch and verify TinyGuestTV as MH_DYLIB
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          GUEST='build-guest/Build/Products/Release-appletvos/TinyGuestTV.app/TinyGuestTV'
+          mkdir -p out
+          cp "$GUEST" out/TinyGuestTV.original
+          cp "$GUEST" out/TinyGuestTV.patched
+          echo '--- before ---'
+          otool -hv out/TinyGuestTV.original
+          ./build-tools/lctv_macho_patch out/TinyGuestTV.patched
+          echo '--- after ---'
+          otool -hv out/TinyGuestTV.patched
+          otool -l out/TinyGuestTV.patched | sed -n '1,120p'
+          python3 Tools/verify_macho.py out/TinyGuestTV.patched
+
+      - name: Package host IPA
         working-directory: tvOS/ProbeMVP0
         run: |
           APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
-          rm -rf out
           mkdir -p out/Payload
           cp -R "$APP" out/Payload/
           cd out
@@ -64,7 +101,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: LiveContainerTV-MVP0
+          name: LiveContainerTV-Prototype
           path: |
             tvOS/ProbeMVP0/out/LiveContainerTV-MVP0.ipa
+            tvOS/ProbeMVP0/out/TinyGuestTV.original
+            tvOS/ProbeMVP0/out/TinyGuestTV.patched
             tvOS/ProbeMVP0/xcodebuild.log
+            tvOS/ProbeMVP0/xcodebuild-guest.log
