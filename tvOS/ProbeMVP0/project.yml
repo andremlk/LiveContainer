@@ -23,6 +23,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.livecontainertv.GuestPayload
         PRODUCT_NAME: GuestPayload
+        INFOPLIST_FILE: GuestPayload/Info.plist
         MACH_O_TYPE: mh_dylib
         SKIP_INSTALL: YES
         DEFINES_MODULE: YES
