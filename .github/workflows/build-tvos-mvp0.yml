@@ -67,7 +67,22 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build | tee xcodebuild-guest.log
 
-      - name: Build MVP1 Mach-O patcher
+      - name: Build UIKitGuestTV executable
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme UIKitGuestTV \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-uikit-guest \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee xcodebuild-uikit-guest.log
+
+      - name: Build Mach-O patcher
         working-directory: tvOS/ProbeMVP0
         run: |
           mkdir -p build-tools
@@ -82,31 +97,63 @@ jobs:
           mkdir -p out
           cp "$GUEST" out/TinyGuestTV.original
           cp "$GUEST" out/TinyGuestTV.patched
-          echo '--- before ---'
+          echo '--- TinyGuestTV before ---'
           otool -hv out/TinyGuestTV.original
           ./build-tools/lctv_macho_patch out/TinyGuestTV.patched
-          echo '--- after ---'
+          echo '--- TinyGuestTV after ---'
           otool -hv out/TinyGuestTV.patched
           otool -l out/TinyGuestTV.patched | sed -n '1,140p'
           python3 Tools/verify_macho.py out/TinyGuestTV.patched
-          echo '--- exported marker ---'
           nm -gU out/TinyGuestTV.patched | tee out/TinyGuestTV.symbols
           grep -q '_LCTVGuestMarker' out/TinyGuestTV.symbols
+          grep -q ' _main$' out/TinyGuestTV.symbols
 
-      - name: Embed patched guest for MVP2A
+      - name: Patch and verify UIKitGuestTV as MH_DYLIB
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          GUEST='build-uikit-guest/Build/Products/Release-appletvos/UIKitGuestTV.app/UIKitGuestTV'
+          cp "$GUEST" out/UIKitGuestTV.original
+          cp "$GUEST" out/UIKitGuestTV.patched
+          echo '--- UIKitGuestTV before ---'
+          otool -hv out/UIKitGuestTV.original
+          ./build-tools/lctv_macho_patch out/UIKitGuestTV.patched
+          echo '--- UIKitGuestTV after ---'
+          otool -hv out/UIKitGuestTV.patched
+          otool -l out/UIKitGuestTV.patched | sed -n '1,180p'
+          python3 Tools/verify_macho.py out/UIKitGuestTV.patched
+          echo '--- UIKit guest exported symbols ---'
+          nm -gU out/UIKitGuestTV.patched | tee out/UIKitGuestTV.symbols
+          grep -q '_LCTVUIKitGuestMarker' out/UIKitGuestTV.symbols
+          grep -q ' _main$' out/UIKitGuestTV.symbols
+          echo '--- UIKit dependencies ---'
+          otool -L out/UIKitGuestTV.patched | tee out/UIKitGuestTV.dependencies
+          grep -q 'UIKit.framework/UIKit' out/UIKitGuestTV.dependencies
+
+      - name: Embed patched guests
         working-directory: tvOS/ProbeMVP0
         run: |
           APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
-          NESTED="$APP/Frameworks/TinyGuestTV.framework"
-          mkdir -p "$NESTED"
-          cp out/TinyGuestTV.patched "$NESTED/TinyGuestTV"
-          cp TinyGuestTV/FrameworkInfo.plist "$NESTED/Info.plist"
-          chmod 755 "$NESTED/TinyGuestTV"
-          test -f "$NESTED/TinyGuestTV"
-          test -f "$NESTED/Info.plist"
-          file "$NESTED/TinyGuestTV"
-          otool -hv "$NESTED/TinyGuestTV"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$NESTED/Info.plist"
+
+          TINY="$APP/Frameworks/TinyGuestTV.framework"
+          mkdir -p "$TINY"
+          cp out/TinyGuestTV.patched "$TINY/TinyGuestTV"
+          cp TinyGuestTV/FrameworkInfo.plist "$TINY/Info.plist"
+          chmod 755 "$TINY/TinyGuestTV"
+
+          UIKIT="$APP/Frameworks/UIKitGuestTV.framework"
+          mkdir -p "$UIKIT"
+          cp out/UIKitGuestTV.patched "$UIKIT/UIKitGuestTV"
+          cp UIKitGuestTV/FrameworkInfo.plist "$UIKIT/Info.plist"
+          chmod 755 "$UIKIT/UIKitGuestTV"
+
+          test -f "$TINY/TinyGuestTV"
+          test -f "$UIKIT/UIKitGuestTV"
+          file "$TINY/TinyGuestTV"
+          file "$UIKIT/UIKitGuestTV"
+          otool -hv "$TINY/TinyGuestTV"
+          otool -hv "$UIKIT/UIKitGuestTV"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$TINY/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$UIKIT/Info.plist"
 
       - name: Package host IPA
         working-directory: tvOS/ProbeMVP0
@@ -126,5 +173,10 @@ jobs:
             tvOS/ProbeMVP0/out/TinyGuestTV.original
             tvOS/ProbeMVP0/out/TinyGuestTV.patched
             tvOS/ProbeMVP0/out/TinyGuestTV.symbols
+            tvOS/ProbeMVP0/out/UIKitGuestTV.original
+            tvOS/ProbeMVP0/out/UIKitGuestTV.patched
+            tvOS/ProbeMVP0/out/UIKitGuestTV.symbols
+            tvOS/ProbeMVP0/out/UIKitGuestTV.dependencies
             tvOS/ProbeMVP0/xcodebuild.log
             tvOS/ProbeMVP0/xcodebuild-guest.log
+            tvOS/ProbeMVP0/xcodebuild-uikit-guest.log

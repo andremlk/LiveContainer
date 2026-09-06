@@ -67,3 +67,20 @@ targets:
         SUPPORTS_MACCATALYST: NO
         DEAD_CODE_STRIPPING: NO
         GCC_SYMBOLS_PRIVATE_EXTERN: NO
+
+  UIKitGuestTV:
+    type: application
+    platform: tvOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: UIKitGuestTV
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.livecontainertv.uikitguest
+        PRODUCT_NAME: UIKitGuestTV
+        INFOPLIST_FILE: UIKitGuestTV/Info.plist
+        TARGETED_DEVICE_FAMILY: "3"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        SUPPORTS_MACCATALYST: NO
+        DEAD_CODE_STRIPPING: NO
+        GCC_SYMBOLS_PRIVATE_EXTERN: NO
