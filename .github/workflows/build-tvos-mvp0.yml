@@ -44,13 +44,18 @@ jobs:
         working-directory: tvOS/ProbeMVP0
         run: |
           APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
-          PAYLOAD="$APP/Frameworks/GuestPayload.framework/GuestPayload"
+          FRAMEWORK="$APP/Frameworks/GuestPayload.framework"
+          PAYLOAD="$FRAMEWORK/GuestPayload"
+          PLIST="$FRAMEWORK/Info.plist"
           test -d "$APP"
           test -f "$PAYLOAD"
+          test -f "$PLIST"
           file "$APP/LiveContainerTV"
           file "$PAYLOAD"
           otool -hv "$PAYLOAD"
           otool -L "$APP/LiveContainerTV"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$PLIST")" = 'FMWK'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")" = 'GuestPayload'
 
       - name: Build TinyGuestTV executable
         working-directory: tvOS/ProbeMVP0
@@ -152,8 +157,24 @@ jobs:
           file "$UIKIT/UIKitGuestTV"
           otool -hv "$TINY/TinyGuestTV"
           otool -hv "$UIKIT/UIKitGuestTV"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$TINY/Info.plist"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$UIKIT/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$TINY/Info.plist")" = 'FMWK'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$UIKIT/Info.plist")" = 'FMWK'
+
+      - name: Verify nested bundles are signer-discoverable
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
+          for NAME in GuestPayload TinyGuestTV UIKitGuestTV; do
+            FRAMEWORK="$APP/Frameworks/$NAME.framework"
+            test -d "$FRAMEWORK"
+            test -f "$FRAMEWORK/Info.plist"
+            EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$FRAMEWORK/Info.plist")"
+            TYPE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$FRAMEWORK/Info.plist")"
+            test "$EXEC" = "$NAME"
+            test "$TYPE" = 'FMWK'
+            test -f "$FRAMEWORK/$EXEC"
+            echo "PASS signer-discoverable bundle: $NAME.framework -> $EXEC ($TYPE)"
+          done
 
       - name: Package host IPA
         working-directory: tvOS/ProbeMVP0
