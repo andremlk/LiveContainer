@@ -87,24 +87,44 @@ jobs:
           ./build-tools/lctv_macho_patch out/TinyGuestTV.patched
           echo '--- after ---'
           otool -hv out/TinyGuestTV.patched
-          otool -l out/TinyGuestTV.patched | sed -n '1,120p'
+          otool -l out/TinyGuestTV.patched | sed -n '1,140p'
           python3 Tools/verify_macho.py out/TinyGuestTV.patched
+          echo '--- exported marker ---'
+          nm -gU out/TinyGuestTV.patched | tee out/TinyGuestTV.symbols
+          grep -q '_LCTVGuestMarker' out/TinyGuestTV.symbols
+
+      - name: Embed patched guest for MVP2A
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
+          NESTED="$APP/Frameworks/TinyGuestTV.framework"
+          mkdir -p "$NESTED"
+          cp out/TinyGuestTV.patched "$NESTED/TinyGuestTV"
+          cp TinyGuestTV/FrameworkInfo.plist "$NESTED/Info.plist"
+          chmod 755 "$NESTED/TinyGuestTV"
+          test -f "$NESTED/TinyGuestTV"
+          test -f "$NESTED/Info.plist"
+          file "$NESTED/TinyGuestTV"
+          otool -hv "$NESTED/TinyGuestTV"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$NESTED/Info.plist"
 
       - name: Package host IPA
         working-directory: tvOS/ProbeMVP0
         run: |
           APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out/Payload
           mkdir -p out/Payload
           cp -R "$APP" out/Payload/
           cd out
-          zip -qry LiveContainerTV-MVP0.ipa Payload
+          zip -qry LiveContainerTV-Prototype.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
           name: LiveContainerTV-Prototype
           path: |
-            tvOS/ProbeMVP0/out/LiveContainerTV-MVP0.ipa
+            tvOS/ProbeMVP0/out/LiveContainerTV-Prototype.ipa
             tvOS/ProbeMVP0/out/TinyGuestTV.original
             tvOS/ProbeMVP0/out/TinyGuestTV.patched
+            tvOS/ProbeMVP0/out/TinyGuestTV.symbols
             tvOS/ProbeMVP0/xcodebuild.log
             tvOS/ProbeMVP0/xcodebuild-guest.log
