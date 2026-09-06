@@ -38,7 +38,7 @@ def main() -> int:
 
     pagezero = None
     has_id_dylib = False
-    has_main = False
+    main_entryoff = None
     off = 32
     for _ in range(ncmds):
         cmd = u32(data, off)
@@ -53,7 +53,9 @@ def main() -> int:
         elif cmd == LC_ID_DYLIB:
             has_id_dylib = True
         elif cmd == LC_MAIN:
-            has_main = True
+            if cmdsize < 24:
+                raise SystemExit("LC_MAIN smaller than entry_point_command")
+            main_entryoff = u64(data, off + 8)
         off += cmdsize
 
     expected_pagezero = (0x100000000 - 0x4000, 0x4000)
@@ -61,13 +63,18 @@ def main() -> int:
         raise SystemExit(f"unexpected __PAGEZERO {pagezero!r}, expected {expected_pagezero!r}")
     if not has_id_dylib:
         raise SystemExit("LC_ID_DYLIB missing")
-    if not has_main:
+    if main_entryoff is None:
         raise SystemExit("LC_MAIN missing")
+    if main_entryoff == 0 or main_entryoff >= len(data):
+        raise SystemExit(f"LC_MAIN entryoff looks invalid: 0x{main_entryoff:x}")
 
     print(
         "PASS: patched Mach-O is MH_DYLIB, has adjusted __PAGEZERO, LC_ID_DYLIB, and preserved LC_MAIN"
     )
-    print(f"flags=0x{flags:08x}, ncmds={ncmds}, sizeofcmds={sizeofcmds}")
+    print(
+        f"flags=0x{flags:08x}, ncmds={ncmds}, sizeofcmds={sizeofcmds}, "
+        f"LC_MAIN.entryoff=0x{main_entryoff:x}"
+    )
     return 0
 
 

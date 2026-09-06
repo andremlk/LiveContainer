@@ -1,5 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <mach-o/loader.h>
+#import <stdint.h>
 
 static NSString *LCTVRunFrameworkProbe(void) {
     NSURL *frameworksURL = NSBundle.mainBundle.privateFrameworksURL;
@@ -31,13 +33,19 @@ static NSString *LCTVRunFrameworkProbe(void) {
     return message;
 }
 
-static NSString *LCTVRunPatchedExecutableProbe(void) {
+static NSString *LCTVPatchedGuestPath(void) {
     NSURL *frameworksURL = NSBundle.mainBundle.privateFrameworksURL;
     if (!frameworksURL) {
+        return nil;
+    }
+    return [[frameworksURL URLByAppendingPathComponent:@"TinyGuestTV.framework/TinyGuestTV"] path];
+}
+
+static NSString *LCTVRunPatchedExecutableProbe(void) {
+    NSString *guestPath = LCTVPatchedGuestPath();
+    if (!guestPath) {
         return @"FAIL MVP2A: Frameworks directory unavailable";
     }
-
-    NSString *guestPath = [[frameworksURL URLByAppendingPathComponent:@"TinyGuestTV.framework/TinyGuestTV"] path];
     if (![NSFileManager.defaultManager fileExistsAtPath:guestPath]) {
         return [NSString stringWithFormat:@"FAIL MVP2A: patched guest missing at %@", guestPath];
     }
@@ -62,6 +70,123 @@ static NSString *LCTVRunPatchedExecutableProbe(void) {
     const char *result = marker();
     NSString *guestResult = result ? [NSString stringWithUTF8String:result] : @"guest returned NULL";
     NSString *message = [NSString stringWithFormat:@"PASS MVP2A: patched MH_EXECUTE loaded as MH_DYLIB (%@)", guestResult];
+    dlclose(handle);
+    return message;
+}
+
+static BOOL LCTVFindLCMainEntryOffset(const struct mach_header_64 *header,
+                                      uint64_t *entryOffsetOut,
+                                      NSString **errorOut) {
+    if (!header || header->magic != MH_MAGIC_64) {
+        if (errorOut) {
+            *errorOut = @"loaded image does not have an ARM64 Mach-O 64 header";
+        }
+        return NO;
+    }
+    if (header->filetype != MH_DYLIB) {
+        if (errorOut) {
+            *errorOut = [NSString stringWithFormat:@"loaded image is not MH_DYLIB (filetype=%u)", header->filetype];
+        }
+        return NO;
+    }
+
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    const uint8_t *end = cursor + header->sizeofcmds;
+    for (uint32_t index = 0; index < header->ncmds; index++) {
+        if (cursor + sizeof(struct load_command) > end) {
+            if (errorOut) {
+                *errorOut = @"load-command table truncated";
+            }
+            return NO;
+        }
+
+        const struct load_command *command = (const struct load_command *)cursor;
+        if (command->cmdsize < sizeof(struct load_command) || cursor + command->cmdsize > end) {
+            if (errorOut) {
+                *errorOut = @"invalid Mach-O load-command size";
+            }
+            return NO;
+        }
+
+        if (command->cmd == LC_MAIN) {
+            if (command->cmdsize < sizeof(struct entry_point_command)) {
+                if (errorOut) {
+                    *errorOut = @"LC_MAIN is smaller than entry_point_command";
+                }
+                return NO;
+            }
+            const struct entry_point_command *entry = (const struct entry_point_command *)command;
+            if (entryOffsetOut) {
+                *entryOffsetOut = entry->entryoff;
+            }
+            return YES;
+        }
+        cursor += command->cmdsize;
+    }
+
+    if (errorOut) {
+        *errorOut = @"LC_MAIN not found in loaded guest";
+    }
+    return NO;
+}
+
+static NSString *LCTVRunLCMainProbe(void) {
+    NSString *guestPath = LCTVPatchedGuestPath();
+    if (!guestPath) {
+        return @"FAIL MVP2B: Frameworks directory unavailable";
+    }
+    if (![NSFileManager.defaultManager fileExistsAtPath:guestPath]) {
+        return [NSString stringWithFormat:@"FAIL MVP2B: patched guest missing at %@", guestPath];
+    }
+
+    dlerror();
+    void *handle = dlopen(guestPath.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        const char *error = dlerror();
+        return [NSString stringWithFormat:@"FAIL MVP2B dlopen: %s", error ?: "unknown error"];
+    }
+
+    dlerror();
+    void *marker = dlsym(handle, "LCTVGuestMarker");
+    const char *symbolError = dlerror();
+    if (!marker || symbolError) {
+        NSString *message = [NSString stringWithFormat:@"FAIL MVP2B marker lookup: %s", symbolError ?: "symbol missing"];
+        dlclose(handle);
+        return message;
+    }
+
+    Dl_info imageInfo = {0};
+    if (dladdr(marker, &imageInfo) == 0 || !imageInfo.dli_fbase) {
+        dlclose(handle);
+        return @"FAIL MVP2B: dladdr could not resolve loaded guest image base";
+    }
+
+    const struct mach_header_64 *header = (const struct mach_header_64 *)imageInfo.dli_fbase;
+    uint64_t entryOffset = 0;
+    NSString *parseError = nil;
+    if (!LCTVFindLCMainEntryOffset(header, &entryOffset, &parseError)) {
+        dlclose(handle);
+        return [NSString stringWithFormat:@"FAIL MVP2B Mach-O parse: %@", parseError ?: @"unknown error"];
+    }
+
+    if (entryOffset > UINTPTR_MAX - (uintptr_t)header) {
+        dlclose(handle);
+        return @"FAIL MVP2B: LC_MAIN entry offset overflows address space";
+    }
+
+    typedef int (*GuestMainFn)(int, char **);
+    GuestMainFn guestMain = (GuestMainFn)((uintptr_t)header + (uintptr_t)entryOffset);
+    int guestReturn = guestMain(0, NULL);
+
+    NSString *message;
+    if (guestReturn == 4242) {
+        message = [NSString stringWithFormat:@"PASS MVP2B: LC_MAIN executed (return=%d, entryoff=0x%llx)",
+                   guestReturn, (unsigned long long)entryOffset];
+    } else {
+        message = [NSString stringWithFormat:@"FAIL MVP2B: LC_MAIN returned %d, expected 4242 (entryoff=0x%llx)",
+                   guestReturn, (unsigned long long)entryOffset];
+    }
+
     dlclose(handle);
     return message;
 }
@@ -94,7 +219,7 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 
     UILabel *subtitle = [[UILabel alloc] init];
     subtitle.translatesAutoresizingMaskIntoConstraints = NO;
-    subtitle.text = @"Hardware validation probes — MVP0 + MVP2A";
+    subtitle.text = @"Hardware validation probes — MVP0 + MVP2A + MVP2B";
     subtitle.textColor = UIColor.lightGrayColor;
     subtitle.font = [UIFont systemFontOfSize:28.0];
     subtitle.textAlignment = NSTextAlignmentCenter;
@@ -102,11 +227,12 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 
     UIButton *frameworkButton = LCTVButton(@"MVP0: load normal framework", self, @selector(runFrameworkProbe:));
     UIButton *patchedButton = LCTVButton(@"MVP2A: load patched tvOS executable", self, @selector(runPatchedProbe:));
+    UIButton *entryButton = LCTVButton(@"MVP2B: execute preserved LC_MAIN", self, @selector(runLCMainProbe:));
 
-    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[frameworkButton, patchedButton]];
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[frameworkButton, patchedButton, entryButton]];
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
     buttons.axis = UILayoutConstraintAxisVertical;
-    buttons.spacing = 34.0;
+    buttons.spacing = 28.0;
     buttons.alignment = UIStackViewAlignmentCenter;
     [self.view addSubview:buttons];
 
@@ -121,17 +247,18 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 
     [NSLayoutConstraint activateConstraints:@[
         [title.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:70],
+        [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:60],
         [subtitle.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [subtitle.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:18],
+        [subtitle.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:16],
         [buttons.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [buttons.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-20],
-        [frameworkButton.widthAnchor constraintGreaterThanOrEqualToConstant:560],
-        [patchedButton.widthAnchor constraintGreaterThanOrEqualToConstant:560],
+        [buttons.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-10],
+        [frameworkButton.widthAnchor constraintGreaterThanOrEqualToConstant:620],
+        [patchedButton.widthAnchor constraintGreaterThanOrEqualToConstant:620],
+        [entryButton.widthAnchor constraintGreaterThanOrEqualToConstant:620],
         [self.statusLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.leadingAnchor constant:90],
         [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.trailingAnchor constant:-90],
         [self.statusLabel.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [self.statusLabel.topAnchor constraintEqualToAnchor:buttons.bottomAnchor constant:55]
+        [self.statusLabel.topAnchor constraintEqualToAnchor:buttons.bottomAnchor constant:45]
     ]];
 }
 
@@ -141,6 +268,10 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 
 - (void)runPatchedProbe:(id)sender {
     self.statusLabel.text = LCTVRunPatchedExecutableProbe();
+}
+
+- (void)runLCMainProbe:(id)sender {
+    self.statusLabel.text = LCTVRunLCMainProbe();
 }
 @end
 
