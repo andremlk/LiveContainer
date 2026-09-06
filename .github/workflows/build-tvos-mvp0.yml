@@ -1,0 +1,70 @@
+name: Build tvOS MVP0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/**'
+      - '.github/workflows/build-tvos-mvp0.yml'
+  pull_request:
+    paths:
+      - 'tvOS/ProbeMVP0/**'
+      - '.github/workflows/build-tvos-mvp0.yml'
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: tvOS/ProbeMVP0
+        run: xcodegen generate
+
+      - name: Build unsigned tvOS app
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme LiveContainerTV \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee xcodebuild.log
+
+      - name: Verify embedded payload
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
+          PAYLOAD="$APP/Frameworks/GuestPayload.framework/GuestPayload"
+          test -d "$APP"
+          test -f "$PAYLOAD"
+          file "$APP/LiveContainerTV"
+          file "$PAYLOAD"
+          otool -hv "$PAYLOAD"
+          otool -L "$APP/LiveContainerTV"
+
+      - name: Package IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          APP='build/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry LiveContainerTV-MVP0.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainerTV-MVP0
+          path: |
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP0.ipa
+            tvOS/ProbeMVP0/xcodebuild.log
