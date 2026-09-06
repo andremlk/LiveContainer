@@ -4,7 +4,7 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
+#import <mach/vm_map.h>
 #import <mach-o/dyld.h>
 #import <objc/runtime.h>
 #import <stdint.h>
@@ -189,16 +189,16 @@ static uint64_t LCTVAarch64EmulateAdrpLdr(uint32_t adrpInstruction,
 }
 
 static BOOL LCTVMakePointerWritable(void *address, NSString **errorOut) {
-    mach_vm_size_t pageSize = (mach_vm_size_t)vm_page_size;
-    mach_vm_address_t page = (mach_vm_address_t)((uintptr_t)address & ~((uintptr_t)pageSize - 1));
-    kern_return_t kr = mach_vm_protect(mach_task_self(),
-                                       page,
-                                       pageSize,
-                                       FALSE,
-                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    vm_size_t pageSize = (vm_size_t)vm_page_size;
+    vm_address_t page = (vm_address_t)((uintptr_t)address & ~((uintptr_t)pageSize - 1));
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                  page,
+                                  pageSize,
+                                  FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
         if (errorOut) {
-            *errorOut = [NSString stringWithFormat:@"mach_vm_protect failed: %d", kr];
+            *errorOut = [NSString stringWithFormat:@"vm_protect failed: %d", kr];
         }
         return NO;
     }
@@ -246,7 +246,7 @@ static BOOL LCTVInstallCFBundleOverride(NSString **errorOut) {
         }
 
         void **candidate = (void **)(uintptr_t)candidateAddress;
-        if (*candidate == (__bridge void *)originalMain) {
+        if (*candidate == (void *)originalMain) {
             mainBundleSlot = candidate;
             break;
         }
