@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <TargetConditionals.h>
 #import "IdentityHooks.h"
+#import "HostPreMainProbe.h"
 
 static NSString * const LCTVLastMVP3ResultKey = @"LCTVLastMVP3Result";
 static NSString * const LCTVLastMVP3IdentityKey = @"LCTVLastMVP3Identity";
@@ -14,6 +15,26 @@ const char *LCTVUIKitGuestMarker(void) {
 #endif
 }
 
+static BOOL LCTVCurrentProbePassed(void) {
+    return LCTVHostPreMainProbeEnabled() ? LCTVHostPreMainProbePassed() : LCTVIdentityProbePassed();
+}
+
+static NSString *LCTVCurrentProbeTitle(void) {
+    return LCTVHostPreMainProbeEnabled() ? LCTVHostPreMainProbeTitle() : LCTVIdentityProbeTitle();
+}
+
+static NSString *LCTVCurrentProbeStatus(void) {
+    return LCTVHostPreMainProbeEnabled() ? LCTVHostPreMainProbeStatus() : LCTVIdentityProbeStatus();
+}
+
+static NSString *LCTVCurrentProbeSnapshot(void) {
+    return LCTVHostPreMainProbeEnabled() ? LCTVHostPreMainProbeSnapshot() : LCTVIdentitySnapshot();
+}
+
+static NSString *LCTVCurrentProbeExpectation(void) {
+    return LCTVHostPreMainProbeEnabled() ? LCTVHostPreMainProbeExpectation() : LCTVIdentityProbeExpectation();
+}
+
 @interface LCTVUIKitGuestViewController : UIViewController
 @end
 
@@ -21,12 +42,12 @@ const char *LCTVUIKitGuestMarker(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    BOOL passed = LCTVIdentityProbePassed();
+    BOOL passed = LCTVCurrentProbePassed();
     self.view.backgroundColor = passed ? UIColor.systemGreenColor : UIColor.systemRedColor;
 
     UILabel *title = [[UILabel alloc] init];
     title.translatesAutoresizingMaskIntoConstraints = NO;
-    title.text = LCTVIdentityProbeTitle();
+    title.text = LCTVCurrentProbeTitle();
     title.textColor = UIColor.blackColor;
     title.font = [UIFont boldSystemFontOfSize:64.0];
     title.textAlignment = NSTextAlignmentCenter;
@@ -42,9 +63,9 @@ const char *LCTVUIKitGuestMarker(void) {
                     "Expected for this isolated probe:\n%@\n\n"
                     "Force-close LiveContainerTV and reopen it to return to the host probe menu.",
                    passed ? @"PASS" : @"FAIL",
-                   LCTVIdentityProbeStatus(),
-                   LCTVIdentitySnapshot(),
-                   LCTVIdentityProbeExpectation()];
+                   LCTVCurrentProbeStatus(),
+                   LCTVCurrentProbeSnapshot(),
+                   LCTVCurrentProbeExpectation()];
     detail.textColor = UIColor.blackColor;
     detail.font = [UIFont monospacedSystemFontOfSize:17.0 weight:UIFontWeightRegular];
     detail.textAlignment = NSTextAlignmentLeft;
@@ -74,14 +95,20 @@ const char *LCTVUIKitGuestMarker(void) {
     (void)application;
     (void)launchOptions;
 
-    BOOL passed = LCTVApplyIdentityAtDidFinishLaunching();
-    NSString *identity = LCTVIdentitySnapshot();
-    NSString *result = [NSString stringWithFormat:@"%@: %@", LCTVIdentityProbeTitle(), passed ? @"PASS" : @"FAIL"];
+    BOOL hostPreMain = LCTVHostPreMainProbeEnabled();
+    BOOL passed = hostPreMain ? LCTVHostPreMainProbePassed() : LCTVApplyIdentityAtDidFinishLaunching();
+    NSString *identity = LCTVCurrentProbeSnapshot();
+    NSString *result = [NSString stringWithFormat:@"%@: %@", LCTVCurrentProbeTitle(), passed ? @"PASS" : @"FAIL"];
 
-    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    [defaults setObject:result forKey:LCTVLastMVP3ResultKey];
-    [defaults setObject:identity forKey:LCTVLastMVP3IdentityKey];
-    [defaults synchronize];
+    // The normal MVP3/4 probes persist their result in the host defaults. In the
+    // MVP5 host-pre-main probe, NSBundle/HOME have already been virtualized before
+    // this point, so intentionally avoid touching standardUserDefaults here.
+    if (!hostPreMain) {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        [defaults setObject:result forKey:LCTVLastMVP3ResultKey];
+        [defaults setObject:identity forKey:LCTVLastMVP3IdentityKey];
+        [defaults synchronize];
+    }
 
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.window.rootViewController = [[LCTVUIKitGuestViewController alloc] init];
@@ -92,6 +119,9 @@ const char *LCTVUIKitGuestMarker(void) {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        // In host-pre-main mode the host has already installed all identity
+        // virtualization. The guest remains in baseline mode, so this function
+        // intentionally performs no guest-side hooks.
         LCTVPrepareIdentityBeforeUIApplicationMain();
         return UIApplicationMain(argc, argv, nil, NSStringFromClass(LCTVUIKitGuestAppDelegate.class));
     }
