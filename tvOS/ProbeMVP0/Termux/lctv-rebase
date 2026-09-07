@@ -50,7 +50,14 @@ PY
 )"
 mkdir -p "$(dirname "$OUT")"
 
-WORK="$(mktemp -d "${TMPDIR:-${PREFIX:-/data/data/com.termux/files/usr}/tmp}/lctv-rebase.XXXXXX")"
+TMP_BASE="${TMPDIR:-}"
+if [ -z "$TMP_BASE" ] && [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/tmp" ]; then
+  TMP_BASE="$PREFIX/tmp"
+fi
+if [ -z "$TMP_BASE" ]; then
+  TMP_BASE="/tmp"
+fi
+WORK="$(mktemp -d "$TMP_BASE/lctv-rebase.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 unzip -q "$CURRENT_IPA" -d "$WORK/current"
