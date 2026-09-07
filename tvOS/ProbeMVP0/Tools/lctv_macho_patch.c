@@ -15,12 +15,50 @@
  *
  * The transformation mirrors the core LCPatchExecSlice strategy used by
  * LiveContainer/LCMachOUtils.m in this AGPL-3.0 repository, intentionally
- * limited to a thin arm64 MH_MAGIC_64 binary for the MVP1 probe.
+ * limited to a thin arm64 MH_MAGIC_64 binary for the prototype path.
+ *
+ * Once an executable is loaded as a guest dylib, @executable_path refers to
+ * LiveContainerTV's executable rather than the guest bundle. Existing guest
+ * LC_RPATH values are therefore retargeted in-place from @executable_path to
+ * @loader_path. The replacement is shorter, so it never grows a load command.
  */
 
 static int fail(const char *message) {
     fprintf(stderr, "lctv_macho_patch: %s\n", message);
     return 1;
+}
+
+static int patch_rpath_for_guest(struct rpath_command *rpath) {
+    if (rpath->cmdsize < sizeof(struct rpath_command) ||
+        rpath->path.offset >= rpath->cmdsize) {
+        return fail("invalid LC_RPATH command");
+    }
+
+    char *path = (char *)rpath + rpath->path.offset;
+    const size_t capacity = rpath->cmdsize - rpath->path.offset;
+    const size_t path_len = strnlen(path, capacity);
+    if (path_len == capacity) {
+        return fail("unterminated LC_RPATH string");
+    }
+
+    const char *old_prefix = "@executable_path";
+    const char *new_prefix = "@loader_path";
+    const size_t old_len = strlen(old_prefix);
+    const size_t new_len = strlen(new_prefix);
+
+    if (path_len < old_len || strncmp(path, old_prefix, old_len) != 0) {
+        return 0;
+    }
+
+    const size_t suffix_len = path_len - old_len;
+    memmove(path + new_len, path + old_len, suffix_len + 1);
+    memcpy(path, new_prefix, new_len);
+
+    const size_t new_path_len = new_len + suffix_len;
+    if (new_path_len + 1 < capacity) {
+        memset(path + new_path_len + 1, 0, capacity - new_path_len - 1);
+    }
+    return 0;
 }
 
 static int patch_macho(void *mapping, size_t file_size) {
@@ -30,10 +68,10 @@ static int patch_macho(void *mapping, size_t file_size) {
 
     struct mach_header_64 *header = (struct mach_header_64 *)mapping;
     if (header->magic != MH_MAGIC_64) {
-        return fail("MVP1 supports thin little-endian 64-bit Mach-O only");
+        return fail("prototype patcher supports thin little-endian 64-bit Mach-O only");
     }
     if (header->cputype != CPU_TYPE_ARM64) {
-        return fail("MVP1 supports arm64 only");
+        return fail("prototype patcher supports arm64 only");
     }
     if (header->filetype != MH_EXECUTE) {
         return fail("input is not MH_EXECUTE");
@@ -69,6 +107,10 @@ static int patch_macho(void *mapping, size_t file_size) {
             dylinker = (struct dylinker_command *)lc;
         } else if (lc->cmd == LC_MAIN) {
             has_main = 1;
+        } else if (lc->cmd == LC_RPATH) {
+            if (patch_rpath_for_guest((struct rpath_command *)lc) != 0) {
+                return 1;
+            }
         }
 
         cursor += lc->cmdsize;
@@ -157,7 +199,7 @@ int main(int argc, char **argv) {
     close(fd);
 
     if (result == 0) {
-        printf("patched %s: MH_EXECUTE -> MH_DYLIB, __PAGEZERO adjusted, LC_ID_DYLIB installed\n", path);
+        printf("patched %s: MH_EXECUTE -> MH_DYLIB, __PAGEZERO adjusted, LC_ID_DYLIB installed, executable rpaths retargeted\n", path);
     }
     return result;
 }
