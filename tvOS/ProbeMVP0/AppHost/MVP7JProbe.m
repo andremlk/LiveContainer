@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <libkern/OSCacheControl.h>
 #import <sys/mman.h>
 #import <sys/types.h>
 #import <unistd.h>
@@ -19,6 +20,7 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 static const NSInteger LCTVJITPanelTag = 0x7A01;
 static const NSInteger LCTVJITLabelTag = 0x7A02;
 static NSString * const LCTVJITProbeDefaultsKey = @"LCTVMVP7JJITProbeResult";
+static char LCTVJITTimerAssociationKey;
 
 static BOOL LCTVJITIsDebugged(void) {
     int flags = 0;
@@ -51,7 +53,7 @@ static NSString *LCTVJITRunExecutableMemoryProbe(void) {
     // arm64: mov w0, #42 ; ret
     const uint32_t code[] = { 0x52800540u, 0xD65F03C0u };
     memcpy(memory, code, sizeof(code));
-    __builtin___clear_cache((char *)memory, (char *)memory + sizeof(code));
+    sys_icache_invalidate(memory, sizeof(code));
 
     if (mprotect(memory, pageSize, PROT_READ | PROT_EXEC) != 0) {
         int savedErrno = errno;
@@ -163,7 +165,7 @@ static void LCTVJITInstallPanelIfNeeded(void) {
         }
         LCTVJITRefreshPanel(strongRoot);
     }];
-    objc_setAssociatedObject(root, @selector(LCTVJITRefreshPanel), timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(root, &LCTVJITTimerAssociationKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 __attribute__((constructor))
