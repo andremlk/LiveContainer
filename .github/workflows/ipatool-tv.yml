@@ -1,0 +1,122 @@
+name: IPATool TV MVP
+
+on:
+  push:
+    branches:
+      - ipatool-tv-mvp
+    paths:
+      - 'IPAToolTV/**'
+      - '.github/workflows/ipatool-tv.yml'
+  workflow_dispatch:
+
+jobs:
+  build-tvos:
+    name: Build unsigned tvOS IPA
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.0'
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Prepare ApplePackage for tvOS
+        run: |
+          set -euo pipefail
+          cd IPAToolTV
+          rm -rf Vendor
+          mkdir -p Vendor
+          git clone --depth 1 https://github.com/Lakr233/ApplePackage.git Vendor/ApplePackage
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          package = Path('Vendor/ApplePackage/Package.swift')
+          text = package.read_text()
+          needle = '        .iOS(.v15),\n'
+          if '        .tvOS(.v15),\n' not in text:
+              if needle not in text:
+                  raise SystemExit('Could not locate iOS platform declaration in ApplePackage Package.swift')
+              text = text.replace(needle, needle + '        .tvOS(.v15),\n', 1)
+          package.write_text(text)
+
+          device = Path('Vendor/ApplePackage/Sources/ApplePackage/Configuration/DeviceIdentifier.swift')
+          text = device.read_text()
+          needle = '#if os(iOS)'
+          replacement = '#if os(iOS) || os(tvOS)'
+          if replacement not in text:
+              if needle not in text:
+                  raise SystemExit('Could not locate DeviceIdentifier platform guard')
+              text = text.replace(needle, replacement, 1)
+          device.write_text(text)
+          PY
+
+          echo '--- Patched platforms ---'
+          grep -n 'tvOS\|iOS' Vendor/ApplePackage/Package.swift | head
+          grep -n '#if os' Vendor/ApplePackage/Sources/ApplePackage/Configuration/DeviceIdentifier.swift | head
+
+      - name: Generate Xcode project
+        run: |
+          cd IPAToolTV
+          xcodegen generate
+          xcodebuild -project IPAToolTV.xcodeproj -scheme IPAToolTV -showdestinations
+
+      - name: Resolve packages
+        run: |
+          cd IPAToolTV
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project IPAToolTV.xcodeproj \
+            -scheme IPAToolTV
+
+      - name: Build tvOS app
+        run: |
+          set -o pipefail
+          cd IPAToolTV
+          xcodebuild \
+            -project IPAToolTV.xcodeproj \
+            -scheme IPAToolTV \
+            -sdk appletvos \
+            -configuration Release \
+            -derivedDataPath build \
+            -destination 'generic/platform=tvOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build | tee build.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          cd IPAToolTV
+          APP_PATH="$(find build/Build/Products/Release-appletvos -maxdepth 1 -type d -name 'IPAToolTV.app' | head -1)"
+          test -n "$APP_PATH"
+          rm -rf Payload IPAToolTV-MVP-unsigned.ipa
+          mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry IPAToolTV-MVP-unsigned.ipa Payload
+          unzip -p IPAToolTV-MVP-unsigned.ipa Payload/IPAToolTV.app/Info.plist > /tmp/IPAToolTV-Info.plist || true
+          ls -lh IPAToolTV-MVP-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPAToolTV-MVP-unsigned
+          path: IPAToolTV/IPAToolTV-MVP-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPAToolTV-build-log
+          path: IPAToolTV/build.log
+          if-no-files-found: ignore
