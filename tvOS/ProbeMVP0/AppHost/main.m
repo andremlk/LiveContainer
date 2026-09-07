@@ -1,9 +1,12 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <stdint.h>
 #import <limits.h>
+#import <stdlib.h>
 #import <string.h>
+#import "GuestRuntime.h"
 
 static NSString * const LCTVBootUIKitGuestNextLaunchKey = @"LCTVBootUIKitGuestNextLaunch";
 static NSString * const LCTVIdentityProbeModeNextLaunchKey = @"LCTVIdentityProbeModeNextLaunch";
@@ -19,6 +22,9 @@ typedef NS_ENUM(NSInteger, LCTVIdentityProbeMode) {
     LCTVIdentityProbeModeHome = 4,
     LCTVIdentityProbeModeProcessName = 5,
     LCTVIdentityProbeModeAll = 6,
+    // Host applies all proven MVP4 identity hooks before guest LC_MAIN. The
+    // synthetic guest only observes them; it installs no identity hooks itself.
+    LCTVIdentityProbeModeHostPreMain = 7,
 };
 
 static NSString *LCTVIdentityModeName(NSInteger mode) {
@@ -30,24 +36,21 @@ static NSString *LCTVIdentityModeName(NSInteger mode) {
         case LCTVIdentityProbeModeHome: return @"MVP4D HOME";
         case LCTVIdentityProbeModeProcessName: return @"MVP4E processName";
         case LCTVIdentityProbeModeAll: return @"MVP4F ALL identity hooks";
+        case LCTVIdentityProbeModeHostPreMain: return @"MVP5P host pre-main identity";
         default: return @"unknown identity mode";
     }
 }
 
 static NSString *LCTVFrameworkExecutablePath(NSString *frameworkName, NSString *executableName) {
     NSURL *frameworksURL = NSBundle.mainBundle.privateFrameworksURL;
-    if (!frameworksURL) {
-        return nil;
-    }
+    if (!frameworksURL) return nil;
     NSString *relative = [NSString stringWithFormat:@"%@.framework/%@", frameworkName, executableName];
     return [[frameworksURL URLByAppendingPathComponent:relative] path];
 }
 
 static NSString *LCTVRunFrameworkProbe(void) {
     NSString *payloadPath = LCTVFrameworkExecutablePath(@"GuestPayload", @"GuestPayload");
-    if (!payloadPath) {
-        return @"FAIL MVP0: Frameworks directory unavailable";
-    }
+    if (!payloadPath) return @"FAIL MVP0: Frameworks directory unavailable";
 
     dlerror();
     void *handle = dlopen(payloadPath.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
@@ -82,9 +85,7 @@ static NSString *LCTVUIKitGuestPath(void) {
 
 static NSString *LCTVRunPatchedExecutableProbe(void) {
     NSString *guestPath = LCTVPatchedGuestPath();
-    if (!guestPath) {
-        return @"FAIL MVP2A: Frameworks directory unavailable";
-    }
+    if (!guestPath) return @"FAIL MVP2A: Frameworks directory unavailable";
     if (![NSFileManager.defaultManager fileExistsAtPath:guestPath]) {
         return [NSString stringWithFormat:@"FAIL MVP2A: patched guest missing at %@", guestPath];
     }
@@ -148,9 +149,25 @@ static BOOL LCTVFindLCMainEntryOffset(const struct mach_header_64 *header,
         }
         cursor += command->cmdsize;
     }
-
     if (errorOut) *errorOut = @"LC_MAIN not found in loaded guest";
     return NO;
+}
+
+static LCTVGuestMainFn LCTVMainForHeader(const struct mach_header_64 *header,
+                                         uint64_t *entryOffsetOut,
+                                         NSString **errorOut) {
+    uint64_t entryOffset = 0;
+    NSString *parseError = nil;
+    if (!LCTVFindLCMainEntryOffset(header, &entryOffset, &parseError)) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"Mach-O parse failed: %@", parseError ?: @"unknown error"];
+        return NULL;
+    }
+    if (entryOffset > UINTPTR_MAX - (uintptr_t)header) {
+        if (errorOut) *errorOut = @"LC_MAIN entry offset overflows address space";
+        return NULL;
+    }
+    if (entryOffsetOut) *entryOffsetOut = entryOffset;
+    return (LCTVGuestMainFn)((uintptr_t)header + (uintptr_t)entryOffset);
 }
 
 static LCTVGuestMainFn LCTVResolveGuestMain(void *handle,
@@ -170,22 +187,38 @@ static LCTVGuestMainFn LCTVResolveGuestMain(void *handle,
         if (errorOut) *errorOut = @"dladdr could not resolve loaded guest image base";
         return NULL;
     }
+    return LCTVMainForHeader((const struct mach_header_64 *)imageInfo.dli_fbase, entryOffsetOut, errorOut);
+}
 
-    const struct mach_header_64 *header = (const struct mach_header_64 *)imageInfo.dli_fbase;
-    uint64_t entryOffset = 0;
-    NSString *parseError = nil;
-    if (!LCTVFindLCMainEntryOffset(header, &entryOffset, &parseError)) {
-        if (errorOut) *errorOut = [NSString stringWithFormat:@"Mach-O parse failed: %@", parseError ?: @"unknown error"];
+static const struct mach_header_64 *LCTVFindLoadedImageHeaderForPath(NSString *guestPath) {
+    NSString *target = [[guestPath stringByStandardizingPath] stringByResolvingSymlinksInPath];
+    const char *targetFS = target.fileSystemRepresentation;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *imageName = _dyld_get_image_name(i);
+        const struct mach_header *rawHeader = _dyld_get_image_header(i);
+        if (!imageName || !rawHeader) continue;
+        NSString *candidate = [[[NSString stringWithUTF8String:imageName] stringByStandardizingPath] stringByResolvingSymlinksInPath];
+        if ([candidate isEqualToString:target] || strcmp(imageName, targetFS) == 0) {
+            const struct mach_header_64 *header = (const struct mach_header_64 *)rawHeader;
+            return header->magic == MH_MAGIC_64 ? header : NULL;
+        }
+    }
+    return NULL;
+}
+
+static LCTVGuestMainFn LCTVResolveGuestMainForPath(NSString *guestPath,
+                                                   const struct mach_header_64 **headerOut,
+                                                   uint64_t *entryOffsetOut,
+                                                   NSString **errorOut) {
+    const struct mach_header_64 *header = LCTVFindLoadedImageHeaderForPath(guestPath);
+    if (!header) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"loaded image not found in dyld list: %@", guestPath];
         return NULL;
     }
-
-    if (entryOffset > UINTPTR_MAX - (uintptr_t)header) {
-        if (errorOut) *errorOut = @"LC_MAIN entry offset overflows address space";
-        return NULL;
-    }
-
-    if (entryOffsetOut) *entryOffsetOut = entryOffset;
-    return (LCTVGuestMainFn)((uintptr_t)header + (uintptr_t)entryOffset);
+    LCTVGuestMainFn mainFn = LCTVMainForHeader(header, entryOffsetOut, errorOut);
+    if (mainFn && headerOut) *headerOut = header;
+    return mainFn;
 }
 
 static NSString *LCTVRunLCMainProbe(void) {
@@ -211,12 +244,9 @@ static NSString *LCTVRunLCMainProbe(void) {
     }
 
     int guestReturn = guestMain(0, NULL);
-    NSString *message;
-    if (guestReturn == 4242) {
-        message = [NSString stringWithFormat:@"PASS MVP2B: LC_MAIN executed (return=%d, entryoff=0x%llx)", guestReturn, (unsigned long long)entryOffset];
-    } else {
-        message = [NSString stringWithFormat:@"FAIL MVP2B: LC_MAIN returned %d, expected 4242 (entryoff=0x%llx)", guestReturn, (unsigned long long)entryOffset];
-    }
+    NSString *message = guestReturn == 4242
+        ? [NSString stringWithFormat:@"PASS MVP2B: LC_MAIN executed (return=%d, entryoff=0x%llx)", guestReturn, (unsigned long long)entryOffset]
+        : [NSString stringWithFormat:@"FAIL MVP2B: LC_MAIN returned %d, expected 4242 (entryoff=0x%llx)", guestReturn, (unsigned long long)entryOffset];
     dlclose(handle);
     return message;
 }
@@ -231,6 +261,11 @@ static int LCTVBootUIKitGuestColdStart(int argc, char *argv[], NSInteger identit
         if (errorOut) *errorOut = [NSString stringWithFormat:@"patched UIKit guest missing at %@", guestPath];
         return INT_MIN;
     }
+
+    NSString *guestBundlePath = guestPath.stringByDeletingLastPathComponent;
+    NSBundle *guestBundleBeforeHooks = [NSBundle bundleWithPath:guestBundlePath];
+    NSString *guestBundleID = guestBundleBeforeHooks.bundleIdentifier ?: @"dev.livecontainertv.uikitguest.patched";
+    NSString *guestProcessName = guestBundleBeforeHooks.infoDictionary[@"CFBundleExecutable"] ?: @"UIKitGuestTV";
 
     dlerror();
     void *handle = dlopen(guestPath.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
@@ -265,11 +300,20 @@ static int LCTVBootUIKitGuestColdStart(int argc, char *argv[], NSInteger identit
         dlclose(handle);
         return INT_MIN;
     }
-    setIdentityMode((int)identityMode);
 
+    const struct mach_header_64 *guestHeader = NULL;
     uint64_t entryOffset = 0;
     NSString *resolveError = nil;
-    LCTVGuestMainFn guestMain = LCTVResolveGuestMain(handle, "LCTVUIKitGuestMarker", &entryOffset, &resolveError);
+    LCTVGuestMainFn guestMain = NULL;
+    if (identityMode == LCTVIdentityProbeModeHostPreMain) {
+        // This path deliberately does not depend on a synthetic exported marker
+        // to resolve LC_MAIN. MVP5 real apps will not export LiveContainer symbols.
+        guestMain = LCTVResolveGuestMainForPath(guestPath, &guestHeader, &entryOffset, &resolveError);
+        setIdentityMode((int)LCTVIdentityProbeModeBaseline);
+    } else {
+        guestMain = LCTVResolveGuestMain(handle, "LCTVUIKitGuestMarker", &entryOffset, &resolveError);
+        setIdentityMode((int)identityMode);
+    }
     if (!guestMain) {
         if (errorOut) *errorOut = resolveError ?: @"entry point resolution failed";
         dlclose(handle);
@@ -280,6 +324,35 @@ static int LCTVBootUIKitGuestColdStart(int argc, char *argv[], NSInteger identit
     [defaults setObject:[NSString stringWithFormat:@"%@ STARTED: jumping to guest LC_MAIN (entryoff=0x%llx)", LCTVIdentityModeName(identityMode), (unsigned long long)entryOffset]
                   forKey:LCTVLastMVP3ResultKey];
     [defaults synchronize];
+
+    if (identityMode == LCTVIdentityProbeModeHostPreMain) {
+        const char *hostHomeCString = getenv("HOME");
+        if (!hostHomeCString) {
+            if (errorOut) *errorOut = @"host HOME unavailable before MVP5P bootstrap";
+            dlclose(handle);
+            return INT_MIN;
+        }
+        NSString *hostHome = [NSString stringWithUTF8String:hostHomeCString];
+        NSString *guestHome = [hostHome stringByAppendingPathComponent:@"Library/Caches/LiveContainerTV/Guests/UIKitGuestTVHostBootstrap/Data"];
+
+        setenv("LCTV_HOST_PREMAIN_PROBE", "1", 1);
+        setenv("LCTV_HOST_EXPECTED_BUNDLE_ID", guestBundleID.UTF8String, 1);
+        setenv("LCTV_HOST_EXPECTED_EXEC_PATH", guestPath.fileSystemRepresentation, 1);
+        setenv("LCTV_HOST_EXPECTED_HOME", guestHome.fileSystemRepresentation, 1);
+        setenv("LCTV_HOST_EXPECTED_PROCESS", guestProcessName.UTF8String, 1);
+
+        NSString *runtimeError = nil;
+        (void)LCTVApplyHostGuestIdentity(guestHeader,
+                                         guestBundlePath,
+                                         guestPath,
+                                         guestBundleID,
+                                         guestProcessName,
+                                         guestHome,
+                                         &runtimeError);
+        // Even a partial setup continues into the observation-only guest. It will
+        // render a red diagnostic screen with the exact identity snapshot instead
+        // of dropping back to the host and hiding the failure point.
+    }
 
     int result = guestMain(argc, argv);
     dlclose(handle);
@@ -325,8 +398,9 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
     UIButton *patchedButton = LCTVButton(@"MVP2A: patched tvOS executable", self, @selector(runPatchedProbe:));
     UIButton *entryButton = LCTVButton(@"MVP2B: execute LC_MAIN", self, @selector(runLCMainProbe:));
     UIButton *baselineButton = LCTVButton(@"MVP3: baseline UIKit guest", self, @selector(armBaseline:));
+    UIButton *hostPreMainButton = LCTVButton(@"MVP5P: host pre-main identity", self, @selector(armHostPreMain:));
 
-    UIStackView *left = [[UIStackView alloc] initWithArrangedSubviews:@[frameworkButton, patchedButton, entryButton, baselineButton]];
+    UIStackView *left = [[UIStackView alloc] initWithArrangedSubviews:@[frameworkButton, patchedButton, entryButton, baselineButton, hostPreMainButton]];
     left.axis = UILayoutConstraintAxisVertical;
     left.spacing = 12.0;
     left.alignment = UIStackViewAlignmentCenter;
@@ -398,6 +472,7 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 - (void)armHome:(id)sender { (void)sender; [self armMode:LCTVIdentityProbeModeHome]; }
 - (void)armProcessName:(id)sender { (void)sender; [self armMode:LCTVIdentityProbeModeProcessName]; }
 - (void)armAll:(id)sender { (void)sender; [self armMode:LCTVIdentityProbeModeAll]; }
+- (void)armHostPreMain:(id)sender { (void)sender; [self armMode:LCTVIdentityProbeModeHostPreMain]; }
 @end
 
 @interface LCTVAppDelegate : UIResponder <UIApplicationDelegate>
@@ -428,15 +503,12 @@ int main(int argc, char *argv[]) {
 
             NSString *bootError = nil;
             int guestResult = LCTVBootUIKitGuestColdStart(argc, argv, mode, &bootError);
-            if (guestResult != INT_MIN) {
-                return guestResult;
-            }
+            if (guestResult != INT_MIN) return guestResult;
 
             NSString *failure = [NSString stringWithFormat:@"FAIL %@ cold-start: %@", LCTVIdentityModeName(mode), bootError ?: @"unknown error"];
             [defaults setObject:failure forKey:LCTVLastMVP3ResultKey];
             [defaults synchronize];
         }
-
         return UIApplicationMain(argc, argv, nil, NSStringFromClass(LCTVAppDelegate.class));
     }
 }
