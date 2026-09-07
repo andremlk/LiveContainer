@@ -1,0 +1,24 @@
+name: tvOS tweak DEB analyzer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-tweaks-prep]
+    paths:
+      - 'tvOS/ProbeMVP0/Tools/lctv_deb_analyze.py'
+      - 'tvOS/ProbeMVP0/TWEAK_SUPPORT_ROADMAP.md'
+      - '.github/workflows/test-tvos-deb-analyzer.yml'
+
+concurrency:
+  group: tvos-deb-analyzer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax check
+        run: python3 -m py_compile tvOS/ProbeMVP0/Tools/lctv_deb_analyze.py
+      - name: Synthetic Debian package self-test
+        run: python3 tvOS/ProbeMVP0/Tools/lctv_deb_analyze.py --self-test
