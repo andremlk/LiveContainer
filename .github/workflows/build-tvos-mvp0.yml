@@ -95,6 +95,49 @@ jobs:
             Tools/lctv_macho_patch.c \
             -o build-tools/lctv_macho_patch
 
+      - name: MVP5A/B self-test — analyze and prepare a packaged tvOS IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          chmod +x Tools/lctv_ipa_analyze.py Tools/lctv_prepare_ipa.sh
+          rm -rf out/mvp5-fixture out/mvp5-prepared
+          mkdir -p out/mvp5-fixture/Payload
+          cp -R build-uikit-guest/Build/Products/Release-appletvos/UIKitGuestTV.app out/mvp5-fixture/Payload/
+          (cd out/mvp5-fixture && zip -qry ../MVP5-Fixture.ipa Payload)
+
+          python3 Tools/lctv_ipa_analyze.py \
+            out/MVP5-Fixture.ipa \
+            --json-out out/MVP5-Fixture-analysis.json | tee out/MVP5-Fixture-analysis.txt
+
+          LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
+            bash Tools/lctv_prepare_ipa.sh out/MVP5-Fixture.ipa out/mvp5-prepared
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('out/MVP5-Fixture-analysis.json').read_text())
+          assert report['compatible_for_mvp5'] is True, report
+          assert report['macho']['filetype_name'] == 'MH_EXECUTE', report['macho']
+          assert report['macho']['arm64'] is True, report['macho']
+          assert report['macho']['lc_main'], report['macho']
+          manifest = json.loads(Path('out/mvp5-prepared/LCTVGuestManifest.json').read_text())
+          prepared = Path('out/mvp5-prepared') / manifest['preparedExecutableRelativePath']
+          assert prepared.is_file(), prepared
+          print('MVP5A PASS: IPA compatibility analysis generated')
+          print('MVP5B PASS: prepared guest executable exists at', prepared)
+          PY
+
+          PREPARED_EXEC="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          out = Path('out/mvp5-prepared')
+          m = json.loads((out / 'LCTVGuestManifest.json').read_text())
+          print(out / m['preparedExecutableRelativePath'])
+          PY
+          )"
+          otool -hv "$PREPARED_EXEC"
+          python3 Tools/verify_macho.py "$PREPARED_EXEC"
+
       - name: Patch and verify TinyGuestTV as MH_DYLIB
         working-directory: tvOS/ProbeMVP0
         run: |
@@ -198,6 +241,10 @@ jobs:
             tvOS/ProbeMVP0/out/UIKitGuestTV.patched
             tvOS/ProbeMVP0/out/UIKitGuestTV.symbols
             tvOS/ProbeMVP0/out/UIKitGuestTV.dependencies
+            tvOS/ProbeMVP0/out/MVP5-Fixture.ipa
+            tvOS/ProbeMVP0/out/MVP5-Fixture-analysis.json
+            tvOS/ProbeMVP0/out/MVP5-Fixture-analysis.txt
+            tvOS/ProbeMVP0/out/mvp5-prepared/**
             tvOS/ProbeMVP0/xcodebuild.log
             tvOS/ProbeMVP0/xcodebuild-guest.log
             tvOS/ProbeMVP0/xcodebuild-uikit-guest.log
