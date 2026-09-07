@@ -2,6 +2,7 @@
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <UIKit/UIKit.h>
+#import <limits.h>
 #import <mach-o/dyld.h>
 #import <stdlib.h>
 
