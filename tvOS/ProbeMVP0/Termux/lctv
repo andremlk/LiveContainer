@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SELF_DIR/.." && pwd)"
+TOOLS="$ROOT/Tools"
+STATE_DIR="${LCTV_STATE_DIR:-$HOME/.local/share/livecontainertv}"
+CONFIG_FILE="${LCTV_CONFIG:-$HOME/.config/livecontainertv/termux.conf}"
+CURRENT_IPA="$STATE_DIR/current.ipa"
+OUTPUT_DIR="${LCTV_OUTPUT_DIR:-/sdcard/Download}"
+
+mkdir -p "$STATE_DIR" "$OUTPUT_DIR"
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: falta '$1'." >&2
+    return 1
+  }
+}
+
+usage() {
+  cat <<'EOF'
+LiveContainerTV MVP7I — Termux importer/install companion
+
+Uso:
+  lctv doctor
+  lctv init <LiveContainerTV-base.ipa>
+  lctv add <guest.ipa> [salida.ipa]
+  lctv install [LiveContainerTV.ipa]
+  lctv add-install <guest.ipa> [salida.ipa]
+
+Estado:
+  ~/.local/share/livecontainertv/current.ipa
+
+Configuración opcional para instalar:
+  ~/.config/livecontainertv/termux.conf
+
+Variables requeridas para 'install':
+  LCTV_ATV_IP
+  LCTV_CUSTOM_IDENTIFIER   # debe ser el mismo bundle ID exterior ya instalado
+
+Variables opcionales:
+  LCTV_CUSTOM_NAME=LiveContainerTV
+  LCTV_PROOT_DISTRO=atvloadly
+  LCTV_UDID=<udid>
+  LCTV_PAIRING_FILE=/data/PlumeImpactor/pairing_files/<udid>.plist
+EOF
+}
+
+abs_path() {
+  python3 - "$1" <<'PY'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+}
+
+find_host_app() {
+  local root="$1"
+  local count host
+  count="$(find "$root/Payload" -maxdepth 1 -type d -name '*.app' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$count" != "1" ]; then
+    echo "ERROR: esperaba exactamente un Payload/*.app; encontré $count" >&2
+    return 1
+  fi
+  host="$(find "$root/Payload" -maxdepth 1 -type d -name '*.app' | head -n1)"
+  printf '%s\n' "$host"
+}
+
+clean_signatures() {
+  local host="$1"
+  find "$host" -type d -name '_CodeSignature' -prune -exec rm -rf {} + 2>/dev/null || true
+  find "$host" -type f \( -name 'embedded.mobileprovision' -o -name 'embedded.provisionprofile' \) -delete 2>/dev/null || true
+}
+
+cmd_doctor() {
+  local failed=0
+  for tool in python3 unzip zip dig proot-distro; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      printf 'PASS %-14s %s\n' "$tool" "$(command -v "$tool")"
+    else
+      printf 'MISS %-14s\n' "$tool"
+      failed=1
+    fi
+  done
+  for f in \
+    "$TOOLS/lctv_macho_patch.py" \
+    "$TOOLS/lctv_ipa_analyze.py" \
+    "$TOOLS/lctv_prepare_ipa.sh" \
+    "$TOOLS/lctv_split_guest.py" \
+    "$TOOLS/lctv_import_guest.py" \
+    "$TOOLS/lctv_registry_from_host.py" \
+    "$TOOLS/lctv_assemble_update.py" \
+    "$TOOLS/verify_macho.py"; do
+    if [ -f "$f" ]; then
+      printf 'PASS file           %s\n' "$(basename "$f")"
+    else
+      printf 'MISS file           %s\n' "$f"
+      failed=1
+    fi
+  done
+  if [ -f "$CURRENT_IPA" ]; then
+    printf 'PASS base           %s\n' "$CURRENT_IPA"
+  else
+    printf 'INFO base           no inicializada; usa: lctv init <base.ipa>\n'
+  fi
+  if [ "$failed" -ne 0 ]; then
+    echo
+    echo "Instala dependencias en Termux con: pkg install python zip unzip dnsutils proot-distro"
+    return 1
+  fi
+  echo "MVP7I DOCTOR PASS"
+}
+
+cmd_init() {
+  [ "$#" -eq 1 ] || { usage; return 2; }
+  need python3; need unzip
+  local base="$1"
+  [ -f "$base" ] || { echo "ERROR: no existe $base" >&2; return 1; }
+  base="$(abs_path "$base")"
+
+  local work host
+  work="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/lctv-init.XXXXXX")"
+  trap 'rm -rf "$work"' RETURN
+  unzip -q "$base" -d "$work/base"
+  host="$(find_host_app "$work/base")"
+  python3 "$TOOLS/lctv_registry_from_host.py" "$host" "$work/registry" >/dev/null
+
+  cp -f "$base" "$CURRENT_IPA"
+  python3 - "$host" "$CURRENT_IPA" <<'PY'
+import plistlib, sys
+from pathlib import Path
+host = Path(sys.argv[1])
+base = Path(sys.argv[2])
+info = plistlib.loads((host / 'Info.plist').read_bytes())
+cat = host / 'LCTVImportCatalog.json'
+count = 0
+if cat.is_file():
+    import json
+    count = len(json.loads(cat.read_text()).get('guests', []))
+print(f"MVP7I INIT PASS: base={base}")
+print(f"  host bundle={info.get('CFBundleIdentifier')} version={info.get('CFBundleShortVersionString')} build={info.get('CFBundleVersion')}")
+print(f"  imported guests={count}")
+PY
+}
+
+build_update() {
+  local guest="$1"
+  local out="${2:-}"
+  need python3; need unzip; need zip
+  [ -f "$CURRENT_IPA" ] || {
+    echo "ERROR: no hay base inicializada. Ejecuta primero: lctv init <LiveContainerTV-base.ipa>" >&2
+    return 1
+  }
+  [ -f "$guest" ] || { echo "ERROR: no existe guest IPA: $guest" >&2; return 1; }
+
+  guest="$(abs_path "$guest")"
+  if [ -z "$out" ]; then
+    out="$OUTPUT_DIR/LiveContainerTV-Termux-Update-$(date +%Y%m%d-%H%M%S).ipa"
+  fi
+  out="$(abs_path "$out")"
+  mkdir -p "$(dirname "$out")"
+
+  local work host
+  work="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/lctv-add.XXXXXX")"
+  trap 'rm -rf "$work"' RETURN
+  unzip -q "$CURRENT_IPA" -d "$work/base"
+  host="$(find_host_app "$work/base")"
+
+  echo '[1/6] Recuperando catálogo actual...'
+  python3 "$TOOLS/lctv_registry_from_host.py" "$host" "$work/registry"
+  cp "$work/registry/LCTVImportCatalog.json" "$work/baseline-catalog.json"
+
+  echo '[2/6] Analizando y preparando IPA...'
+  python3 "$TOOLS/lctv_import_guest.py" \
+    "$guest" \
+    "$work/registry" \
+    --patcher "$TOOLS/lctv_macho_patch.py"
+
+  echo '[3/6] Ensamblando actualización incremental...'
+  python3 "$TOOLS/lctv_assemble_update.py" \
+    "$host" \
+    "$work/registry" \
+    --baseline-catalog "$work/baseline-catalog.json"
+
+  echo '[4/6] Limpiando firmas antiguas...'
+  clean_signatures "$host"
+
+  echo '[5/6] Empaquetando LiveContainerTV...'
+  rm -f "$out"
+  (cd "$work/base" && zip -qry "$out" Payload)
+
+  echo '[6/6] Verificando salida...'
+  python3 - "$out" <<'PY'
+import hashlib, json, plistlib, sys, zipfile
+from pathlib import Path
+ipa = Path(sys.argv[1])
+h = hashlib.sha256()
+with ipa.open('rb') as f:
+    for chunk in iter(lambda: f.read(1024*1024), b''):
+        h.update(chunk)
+with zipfile.ZipFile(ipa) as z:
+    apps = sorted({n.split('/', 2)[1] for n in z.namelist() if n.startswith('Payload/') and len(n.split('/')) >= 3 and n.split('/',2)[1].endswith('.app')})
+    if len(apps) != 1:
+        raise SystemExit(f'bad output app count: {apps}')
+    root = f'Payload/{apps[0]}/'
+    catalog = json.loads(z.read(root + 'LCTVImportCatalog.json'))
+    update = json.loads(z.read(root + 'LCTVUpdateManifest.json'))
+print('MVP7I PACKAGE PASS')
+print('  guests=', len(catalog.get('guests', [])))
+print('  added=', update.get('added', []))
+print('  updated=', update.get('updated', []))
+print('  preserved=', update.get('preserved', []))
+print('  sha256=', h.hexdigest())
+print('  output=', ipa)
+PY
+
+  cp -f "$out" "$CURRENT_IPA"
+  printf '%s\n' "$out"
+}
+
+resolve_install_identity() {
+  : "${LCTV_ATV_IP:?LCTV_ATV_IP no está configurado}"
+  : "${LCTV_CUSTOM_IDENTIFIER:?LCTV_CUSTOM_IDENTIFIER no está configurado; usa exactamente el bundle ID exterior que ya tienes instalado}"
+  LCTV_CUSTOM_NAME="${LCTV_CUSTOM_NAME:-LiveContainerTV}"
+  LCTV_PROOT_DISTRO="${LCTV_PROOT_DISTRO:-atvloadly}"
+}
+
+install_ipa() {
+  local ipa="$1"
+  need dig; need proot-distro; need python3
+  [ -f "$ipa" ] || { echo "ERROR: IPA para instalar no existe: $ipa" >&2; return 1; }
+  resolve_install_identity
+  ipa="$(abs_path "$ipa")"
+
+  echo '[install 1/3] Buscando puerto RSD...'
+  local mdns rsd_port
+  mdns="$(dig @"$LCTV_ATV_IP" -p 5353 _remotepairing._tcp.local PTR +noall +answer +additional 2>/dev/null || true)"
+  rsd_port="$(printf '%s\n' "$mdns" | awk '$4 == "SRV" {print $7; exit}')"
+  if ! [[ "$rsd_port" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: no pude obtener RSD_PORT desde $LCTV_ATV_IP" >&2
+    printf '%s\n' "$mdns" >&2
+    return 1
+  fi
+  echo "  RSD_PORT=$rsd_port"
+
+  echo '[install 2/3] Preflight AFC...'
+  local q_ipa q_ip q_port q_id q_name q_udid q_pair
+  printf -v q_ipa '%q' "$ipa"
+  printf -v q_ip '%q' "$LCTV_ATV_IP"
+  printf -v q_port '%q' "$rsd_port"
+  printf -v q_id '%q' "$LCTV_CUSTOM_IDENTIFIER"
+  printf -v q_name '%q' "$LCTV_CUSTOM_NAME"
+  printf -v q_udid '%q' "${LCTV_UDID:-}"
+  printf -v q_pair '%q' "${LCTV_PAIRING_FILE:-}"
+
+  proot-distro login "$LCTV_PROOT_DISTRO" -- bash -lc "
+set -euo pipefail
+IPA_SRC=$q_ipa
+ATV_IP=$q_ip
+RSD_PORT=$q_port
+CUSTOM_ID=$q_id
+CUSTOM_NAME=$q_name
+UDID=$q_udid
+PAIRING_FILE=$q_pair
+
+if [ -z \"\$PAIRING_FILE\" ]; then
+  mapfile -t PAIRS < <(find /data/PlumeImpactor/pairing_files -maxdepth 1 -type f -name '*.plist' | sort)
+  if [ \"\${#PAIRS[@]}\" -ne 1 ]; then
+    echo \"ERROR: encontré \${#PAIRS[@]} pairing files. Define LCTV_PAIRING_FILE y LCTV_UDID.\" >&2
+    exit 1
+  fi
+  PAIRING_FILE=\"\${PAIRS[0]}\"
+fi
+if [ -z \"\$UDID\" ]; then
+  UDID=\"\$(basename \"\$PAIRING_FILE\" .plist)\"
+fi
+IPA_DATA='/data/LiveContainerTV-Termux-Install.ipa'
+cp -- \"\$IPA_SRC\" \"\$IPA_DATA\"
+plumesign check afc --ip \"\$ATV_IP\" --port \"\$RSD_PORT\" --udid \"\$UDID\"
+"
+
+  echo '[install 3/3] Firmando e instalando en Apple TV...'
+  proot-distro login "$LCTV_PROOT_DISTRO" -- bash -lc "
+set -euo pipefail
+ATV_IP=$q_ip
+RSD_PORT=$q_port
+CUSTOM_ID=$q_id
+CUSTOM_NAME=$q_name
+UDID=$q_udid
+PAIRING_FILE=$q_pair
+if [ -z \"\$PAIRING_FILE\" ]; then
+  mapfile -t PAIRS < <(find /data/PlumeImpactor/pairing_files -maxdepth 1 -type f -name '*.plist' | sort)
+  if [ \"\${#PAIRS[@]}\" -ne 1 ]; then exit 1; fi
+  PAIRING_FILE=\"\${PAIRS[0]}\"
+fi
+if [ -z \"\$UDID\" ]; then UDID=\"\$(basename \"\$PAIRING_FILE\" .plist)\"; fi
+plumesign sign-rsd \
+  --package '/data/LiveContainerTV-Termux-Install.ipa' \
+  --apple-id \
+  --register-and-install \
+  --udid \"\$UDID\" \
+  --ip \"\$ATV_IP\" \
+  --port \"\$RSD_PORT\" \
+  --pairing-file \"\$PAIRING_FILE\" \
+  --custom-name \"\$CUSTOM_NAME\" \
+  --custom-identifier \"\$CUSTOM_ID\"
+"
+  echo 'MVP7I INSTALL PASS'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  doctor)
+    shift
+    cmd_doctor "$@"
+    ;;
+  init)
+    shift
+    cmd_init "$@"
+    ;;
+  add)
+    shift
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { usage; exit 2; }
+    build_update "$@"
+    ;;
+  install)
+    shift
+    [ "$#" -le 1 ] || { usage; exit 2; }
+    install_ipa "${1:-$CURRENT_IPA}"
+    ;;
+  add-install)
+    shift
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { usage; exit 2; }
+    built="$(build_update "$@" | tee /dev/stderr | tail -n1)"
+    install_ipa "$built"
+    ;;
+  -h|--help|help|'')
+    usage
+    ;;
+  *)
+    echo "ERROR: comando desconocido: $cmd" >&2
+    usage
+    exit 2
+    ;;
+esac
