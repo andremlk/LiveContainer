@@ -1,0 +1,135 @@
+name: MVP7I Regression Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/Tools/lctv_macho_patch.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_split_guest.py'
+      - '.github/workflows/test-tvos-mvp7i-regressions.yml'
+
+jobs:
+  regressions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 -m py_compile Tools/lctv_macho_patch.py Tools/lctv_split_guest.py
+
+      - name: Duplicate LC_RPATH regression
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import struct
+          from pathlib import Path
+
+          MH_MAGIC_64 = 0xFEEDFACF
+          CPU_TYPE_ARM64 = 0x0100000C
+          MH_EXECUTE = 0x2
+          MH_PIE = 0x00200000
+          LC_SEGMENT_64 = 0x19
+          LC_LOAD_DYLINKER = 0xE
+          LC_MAIN = 0x80000028
+          LC_RPATH = 0x8000001C
+
+          def align8(n):
+              return (n + 7) & ~7
+
+          def rpath(path):
+              raw = path.encode() + b'\0'
+              size = align8(12 + len(raw))
+              return struct.pack('<III', LC_RPATH, size, 12) + raw + b'\0' * (size - 12 - len(raw))
+
+          seg = struct.pack(
+              '<II16sQQQQiiII',
+              LC_SEGMENT_64, 72, b'__PAGEZERO\0\0\0\0\0\0',
+              0, 0x100000000, 0, 0, 0, 0, 0, 0,
+          )
+          dylinker_size = 32
+          dylinker = struct.pack('<III', LC_LOAD_DYLINKER, dylinker_size, 12) + b'/usr/lib/dyld\0'
+          dylinker += b'\0' * (dylinker_size - len(dylinker))
+          main = struct.pack('<IIQQ', LC_MAIN, 24, 0x100, 0)
+          rp_exec = rpath('@executable_path/Frameworks')
+          rp_loader = rpath('@loader_path/Frameworks')
+          commands = seg + dylinker + main + rp_exec + rp_loader
+          header = struct.pack(
+              '<IiiIIIII',
+              MH_MAGIC_64, CPU_TYPE_ARM64, 0, MH_EXECUTE,
+              5, len(commands), MH_PIE, 0,
+          )
+          Path('/tmp/lctv-duplicate-rpath.bin').write_bytes(header + commands)
+          PY
+
+          python3 Tools/lctv_macho_patch.py /tmp/lctv-duplicate-rpath.bin | tee /tmp/patch.log
+          grep -q '(rpaths=0)' /tmp/patch.log
+
+          python3 - <<'PY'
+          import struct
+          from pathlib import Path
+
+          data = Path('/tmp/lctv-duplicate-rpath.bin').read_bytes()
+          ncmds = struct.unpack_from('<I', data, 16)[0]
+          cursor = 32
+          paths = []
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from('<II', data, cursor)
+              if cmd == 0x8000001C:
+                  off = struct.unpack_from('<I', data, cursor + 8)[0]
+                  start = cursor + off
+                  end = data.index(b'\0', start, cursor + size)
+                  paths.append(data[start:end].decode())
+              cursor += size
+          assert paths.count('@loader_path/Frameworks') == 1, paths
+          assert paths.count('@executable_path/Frameworks') == 1, paths
+          print('DUPLICATE LC_RPATH REGRESSION PASS', paths)
+          PY
+
+      - name: SC_Info resource-seed regression
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/lctv-split-test
+          mkdir -p /tmp/lctv-split-test/prepared/Test.app/SC_Info
+          mkdir -p /tmp/lctv-split-test/prepared/Test.app/Frameworks/Dummy.framework
+          printf 'protected-metadata' > /tmp/lctv-split-test/prepared/Test.app/SC_Info/test.sinf
+          printf 'guest-code' > /tmp/lctv-split-test/prepared/Test.app/Test
+          printf 'framework-code' > /tmp/lctv-split-test/prepared/Test.app/Frameworks/Dummy.framework/Dummy
+
+          python3 - <<'PY'
+          import json, plistlib
+          from pathlib import Path
+          root = Path('/tmp/lctv-split-test/prepared')
+          app = root / 'Test.app'
+          info = {
+              'CFBundleIdentifier': 'dev.livecontainertv.regression',
+              'CFBundleName': 'Test',
+              'CFBundleDisplayName': 'Test',
+              'CFBundleExecutable': 'Test',
+              'CFBundlePackageType': 'APPL',
+              'CFBundleShortVersionString': '1.0',
+              'CFBundleVersion': '1',
+          }
+          (app / 'Info.plist').write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_XML))
+          (root / 'LCTVGuestManifest.json').write_text(json.dumps({
+              'originalBundleName': 'Test.app',
+              'executable': 'Test',
+          }))
+          PY
+
+          python3 Tools/lctv_split_guest.py \
+            /tmp/lctv-split-test/prepared \
+            /tmp/lctv-split-test/Test.code.framework \
+            /tmp/lctv-split-test/Test.resources.lctvseed
+
+          test ! -e /tmp/lctv-split-test/Test.resources.lctvseed/SC_Info
+          test ! -e /tmp/lctv-split-test/Test.resources.lctvseed/Test
+          test ! -e /tmp/lctv-split-test/Test.resources.lctvseed/Frameworks
+          test -f /tmp/lctv-split-test/Test.code.framework/Test
+          test -d /tmp/lctv-split-test/Test.code.framework/Frameworks
+          echo 'SC_INFO RESOURCE-SEED REGRESSION PASS'
