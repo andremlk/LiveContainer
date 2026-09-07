@@ -69,6 +69,10 @@ def main():
     shutil.rmtree(resource_seed / '_CodeSignature', ignore_errors=True)
     shutil.rmtree(resource_seed / 'Frameworks', ignore_errors=True)
     shutil.rmtree(resource_seed / 'PlugIns', ignore_errors=True)
+    # App Store metadata can be protected even when the Mach-O itself is
+    # unencrypted. It is not a runtime resource and cannot be mirrored into
+    # the writable split store on tvOS.
+    shutil.rmtree(resource_seed / 'SC_Info', ignore_errors=True)
     for profile in ('embedded.mobileprovision', 'embedded.provisionprofile'):
         try:
             (resource_seed / profile).unlink()
