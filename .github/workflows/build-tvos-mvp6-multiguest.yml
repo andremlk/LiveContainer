@@ -1,0 +1,215 @@
+name: MVP6 Multi-Guest tvOS Library
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/**'
+      - '.github/workflows/build-tvos-mvp6-multiguest.yml'
+
+concurrency:
+  group: tvos-mvp6-multiguest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  multiguest:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build LiveContainerTV Mach-O patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p build-tools out
+          xcrun clang -std=c11 -Wall -Wextra -Werror \
+            Tools/lctv_macho_patch.c \
+            -o build-tools/lctv_macho_patch
+
+      - name: Build known-good Sample Guide IPA
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/lctv-mvp6-sample
+          git clone --quiet https://github.com/abdulkarimkhaan/tvOS-sample-guide.git /tmp/lctv-mvp6-sample
+          cd /tmp/lctv-mvp6-sample
+          git checkout --quiet e1a672c59e2d3045542e351d326aa7642c4fa895
+
+          OUT="$GITHUB_WORKSPACE/tvOS/ProbeMVP0/out"
+          xcodebuild \
+            -project tvOS-Sample-Guide.xcodeproj \
+            -scheme tvOS-Sample-Guide \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$OUT/mvp6-sample-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee "$OUT/mvp6-sample-xcodebuild.log"
+
+          PRODUCTS="$OUT/mvp6-sample-derived/Build/Products/Release-appletvos"
+          APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          test -n "$APP"
+          rm -rf "$OUT/mvp6-sample-ipa"
+          mkdir -p "$OUT/mvp6-sample-ipa/Payload"
+          cp -R "$APP" "$OUT/mvp6-sample-ipa/Payload/"
+          (cd "$OUT/mvp6-sample-ipa" && zip -qry ../MVP6-Sample-Guide.ipa Payload)
+          test -f "$OUT/MVP6-Sample-Guide.ipa"
+
+      - name: Download pinned NuvioTV unsigned IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          NUVIO='out/NuvioTV-3.3.3-unsigned-release.ipa'
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$NUVIO" \
+            'https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa'
+          echo '80d6f9b4fbd29b20bdbea71e493a782c9bd1a38ca5541a11940666054118eee1  out/NuvioTV-3.3.3-unsigned-release.ipa' | shasum -a 256 -c -
+
+          mkdir -p out/nuvio-license
+          curl -fL -o out/nuvio-license/LICENSE.txt \
+            'https://raw.githubusercontent.com/bobsupra/NuvioTVOS/tvos-beta-3.3.3/LICENSE'
+          printf '%s\n' \
+            'NuvioTVOS source: https://github.com/bobsupra/NuvioTVOS/tree/tvos-beta-3.3.3' \
+            'Binary source: upstream unsigned release tvos-beta-3.3.3' \
+            > out/nuvio-license/SOURCE.txt
+
+      - name: Analyze both external guests
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_ipa_analyze.py \
+            out/MVP6-Sample-Guide.ipa \
+            --json-out out/MVP6-Sample-analysis.json | tee out/MVP6-Sample-analysis.txt
+
+          python3 Tools/lctv_ipa_analyze.py \
+            out/NuvioTV-3.3.3-unsigned-release.ipa \
+            --json-out out/MVP6-Nuvio-analysis.json | tee out/MVP6-Nuvio-analysis.txt
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          for name in ('Sample', 'Nuvio'):
+              report = json.loads(Path(f'out/MVP6-{name}-analysis.json').read_text())
+              assert report['compatible_for_mvp5'] is True, report
+              assert report['macho']['arm64'] is True, report
+              assert report['macho']['filetype_name'] == 'MH_EXECUTE', report
+              assert report['macho']['lc_main'], report
+              assert not report['macho']['encrypted'], report
+              print(f'MVP6 ANALYZE PASS {name}:', report['app']['display_name'], report['app']['bundle_id'])
+          PY
+
+      - name: Prepare and wrap Sample Guide guest
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          chmod +x Tools/lctv_prepare_ipa.sh
+          LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
+            bash Tools/lctv_prepare_ipa.sh \
+              out/MVP6-Sample-Guide.ipa \
+              out/mvp6-sample-prepared
+          python3 Tools/lctv_wrap_guest_framework.py \
+            out/mvp6-sample-prepared \
+            out/MVP6SampleGuest.framework
+
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' out/MVP6SampleGuest.framework/Info.plist)"
+          test -f "out/MVP6SampleGuest.framework/$EXEC"
+          python3 Tools/verify_macho.py "out/MVP6SampleGuest.framework/$EXEC"
+          otool -L "out/MVP6SampleGuest.framework/$EXEC" | tee out/MVP6-Sample-dependencies.txt
+
+      - name: Prepare and wrap NuvioTV guest
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
+            bash Tools/lctv_prepare_ipa.sh \
+              out/NuvioTV-3.3.3-unsigned-release.ipa \
+              out/mvp6-nuvio-prepared
+          python3 Tools/lctv_wrap_guest_framework.py \
+            out/mvp6-nuvio-prepared \
+            out/MVP6NuvioGuest.framework
+
+          mkdir -p out/MVP6NuvioGuest.framework/Licenses/NuvioTVOS
+          cp out/nuvio-license/LICENSE.txt out/MVP6NuvioGuest.framework/Licenses/NuvioTVOS/
+          cp out/nuvio-license/SOURCE.txt out/MVP6NuvioGuest.framework/Licenses/NuvioTVOS/
+
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' out/MVP6NuvioGuest.framework/Info.plist)"
+          test -f "out/MVP6NuvioGuest.framework/$EXEC"
+          test ! -d out/MVP6NuvioGuest.framework/PlugIns
+          python3 Tools/verify_macho.py "out/MVP6NuvioGuest.framework/$EXEC"
+          otool -L "out/MVP6NuvioGuest.framework/$EXEC" | tee out/MVP6-Nuvio-dependencies.txt
+          find out/MVP6NuvioGuest.framework/Frameworks -maxdepth 2 -type f -o -type d 2>/dev/null | sort | tee out/MVP6-Nuvio-embedded-frameworks.txt || true
+
+      - name: Build MVP6 multi-guest host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme LiveContainerTVMVP6 \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp6-host \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp6-host-xcodebuild.log
+
+      - name: Stage both guests inside LiveContainerTV
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp6-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          test -d "$HOST"
+          mkdir -p "$HOST/Frameworks"
+
+          rm -rf "$HOST/Frameworks/MVP6SampleGuest.framework"
+          rm -rf "$HOST/Frameworks/MVP6NuvioGuest.framework"
+          cp -R out/MVP6SampleGuest.framework "$HOST/Frameworks/MVP6SampleGuest.framework"
+          cp -R out/MVP6NuvioGuest.framework "$HOST/Frameworks/MVP6NuvioGuest.framework"
+
+          for FW in MVP6SampleGuest MVP6NuvioGuest; do
+            INFO="$HOST/Frameworks/$FW.framework/Info.plist"
+            test -f "$INFO"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$INFO")" = 'FMWK'
+            EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO")"
+            test -f "$HOST/Frameworks/$FW.framework/$EXEC"
+            python3 Tools/verify_macho.py "$HOST/Frameworks/$FW.framework/$EXEC"
+            echo "MVP6 STAGED: $FW.framework/$EXEC"
+          done
+
+      - name: Package MVP6 multi-guest IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp6-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          test -f "$HOST/Frameworks/MVP6SampleGuest.framework/Info.plist"
+          test -f "$HOST/Frameworks/MVP6NuvioGuest.framework/Info.plist"
+
+          rm -rf out/mvp6-host-ipa
+          mkdir -p out/mvp6-host-ipa/Payload
+          cp -R "$HOST" out/mvp6-host-ipa/Payload/
+          (cd out/mvp6-host-ipa && zip -qry ../LiveContainerTV-MVP6-MultiGuest.ipa Payload)
+          test -f out/LiveContainerTV-MVP6-MultiGuest.ipa
+          shasum -a 256 out/LiveContainerTV-MVP6-MultiGuest.ipa | tee out/MVP6-IPA-SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MVP6-MultiGuest-Nuvio-Sample
+          path: |
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP6-MultiGuest.ipa
+            tvOS/ProbeMVP0/out/MVP6-IPA-SHA256.txt
+            tvOS/ProbeMVP0/out/MVP6-Sample-analysis.json
+            tvOS/ProbeMVP0/out/MVP6-Sample-analysis.txt
+            tvOS/ProbeMVP0/out/MVP6-Nuvio-analysis.json
+            tvOS/ProbeMVP0/out/MVP6-Nuvio-analysis.txt
+            tvOS/ProbeMVP0/out/MVP6-Sample-dependencies.txt
+            tvOS/ProbeMVP0/out/MVP6-Nuvio-dependencies.txt
+            tvOS/ProbeMVP0/out/MVP6-Nuvio-embedded-frameworks.txt
+            tvOS/ProbeMVP0/out/nuvio-license/**
+            tvOS/ProbeMVP0/out/mvp6-host-xcodebuild.log
+            tvOS/ProbeMVP0/out/mvp6-sample-xcodebuild.log
