@@ -59,9 +59,15 @@ jobs:
           test -f "$BIN"
           file "$BIN"
           lipo -info "$BIN" | tee out-mvp7j/lipo.txt
-          strings "$BIN" | grep -F 'MVP7J JIT' | head -n 5
-          strings "$BIN" | grep -F 'CS_DEBUGGED=YES' | head -n 5
-          strings "$BIN" | grep -F 'Run JIT memory probe' | head -n 5
+
+          # Objective-C NSString literals are not reliably emitted by `strings`.
+          # Verify the JIT probe source was compiled into the executable by checking
+          # its two required external APIs instead.
+          nm -u "$BIN" | grep -E '(_csops|csops)$' | tee out-mvp7j/csops-symbol.txt
+          nm -u "$BIN" | grep -E '(_sys_icache_invalidate|sys_icache_invalidate)$' | tee out-mvp7j/icache-symbol.txt
+          grep -F 'Run JIT memory probe' AppHost/MVP7JProbe.m
+          grep -F 'CS_DEBUGGED=YES' AppHost/MVP7JProbe.m
+
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee out-mvp7j/bundle-id.txt
           /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" | tee out-mvp7j/executable.txt
 
@@ -85,4 +91,6 @@ jobs:
             tvOS/ProbeMVP0/out-mvp7j/LiveContainerTV-MVP7J-JIT-HostTemplate.ipa
             tvOS/ProbeMVP0/out-mvp7j/SHA256.txt
             tvOS/ProbeMVP0/out-mvp7j/xcodebuild.log
+            tvOS/ProbeMVP0/out-mvp7j/csops-symbol.txt
+            tvOS/ProbeMVP0/out-mvp7j/icache-symbol.txt
           if-no-files-found: error
