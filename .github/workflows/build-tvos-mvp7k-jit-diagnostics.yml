@@ -1,0 +1,92 @@
+name: MVP7K JIT Diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp7k-diagnostics]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7HMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/MVP7KProbe.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/AppHost/Info.plist'
+      - 'tvOS/ProbeMVP0/project-mvp7k.yml'
+      - '.github/workflows/build-tvos-mvp7k-jit-diagnostics.yml'
+
+concurrency:
+  group: tvos-mvp7k-jit-diagnostics-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-host-template:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate standalone MVP7K project
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project-mvp7k.yml
+
+      - name: Build unsigned tvOS host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf build-mvp7k out-mvp7k
+          mkdir -p out-mvp7k
+          xcodebuild \
+            -project LiveContainerTVMVP7K.xcodeproj \
+            -scheme LiveContainerTVMVP7K \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7k \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out-mvp7k/xcodebuild.log
+
+      - name: Verify MVP7K diagnostic binary
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          APP='build-mvp7k/Build/Products/Release-appletvos/LiveContainerTV.app'
+          BIN="$APP/LiveContainerTV"
+          test -d "$APP"
+          test -f "$BIN"
+          file "$BIN"
+          lipo -info "$BIN" | tee out-mvp7k/lipo.txt
+          nm -u "$BIN" | grep -E '(_csops|csops)$' | tee out-mvp7k/csops-symbol.txt
+          nm -u "$BIN" | grep -E '(_sys_icache_invalidate|sys_icache_invalidate)$' | tee out-mvp7k/icache-symbol.txt
+          grep -F 'MAP_JIT RWX' AppHost/MVP7KProbe.m | tee out-mvp7k/map-jit-source.txt
+          grep -F 'Run full JIT diagnostics' AppHost/MVP7KProbe.m
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee out-mvp7k/bundle-id.txt
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" | tee out-mvp7k/executable.txt
+
+      - name: Package host template IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          APP='build-mvp7k/Build/Products/Release-appletvos/LiveContainerTV.app'
+          PKG='out-mvp7k/package/Payload'
+          rm -rf out-mvp7k/package
+          mkdir -p "$PKG"
+          cp -R "$APP" "$PKG/"
+          (cd out-mvp7k/package && zip -qry ../LiveContainerTV-MVP7K-JIT-Diagnostics.ipa Payload)
+          shasum -a 256 out-mvp7k/LiveContainerTV-MVP7K-JIT-Diagnostics.ipa | tee out-mvp7k/SHA256.txt
+
+      - name: Upload MVP7K diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainerTV-MVP7K-JIT-Diagnostics
+          path: |
+            tvOS/ProbeMVP0/out-mvp7k/LiveContainerTV-MVP7K-JIT-Diagnostics.ipa
+            tvOS/ProbeMVP0/out-mvp7k/SHA256.txt
+            tvOS/ProbeMVP0/out-mvp7k/xcodebuild.log
+            tvOS/ProbeMVP0/out-mvp7k/csops-symbol.txt
+            tvOS/ProbeMVP0/out-mvp7k/icache-symbol.txt
+            tvOS/ProbeMVP0/out-mvp7k/map-jit-source.txt
+          if-no-files-found: error
