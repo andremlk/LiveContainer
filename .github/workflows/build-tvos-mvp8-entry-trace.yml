@@ -1,0 +1,91 @@
+name: MVP8 Entry Trace
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp8-entry-trace]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7HMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/MVP8Main.m'
+      - 'tvOS/ProbeMVP0/AppHost/MVP8Trace.h'
+      - 'tvOS/ProbeMVP0/AppHost/MVP8Trace.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/AppHost/Info.plist'
+      - 'tvOS/ProbeMVP0/project-mvp8.yml'
+      - '.github/workflows/build-tvos-mvp8-entry-trace.yml'
+
+concurrency:
+  group: tvos-mvp8-entry-trace-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-host-template:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate standalone MVP8 project
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project-mvp8.yml
+
+      - name: Build unsigned tvOS host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf build-mvp8 out-mvp8
+          mkdir -p out-mvp8
+          xcodebuild \
+            -project LiveContainerTVMVP8.xcodeproj \
+            -scheme LiveContainerTVMVP8 \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp8 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out-mvp8/xcodebuild.log
+
+      - name: Verify MVP8 trace binary
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          APP='build-mvp8/Build/Products/Release-appletvos/LiveContainerTV.app'
+          BIN="$APP/LiveContainerTV"
+          test -d "$APP"
+          test -f "$BIN"
+          file "$BIN"
+          lipo -info "$BIN" | tee out-mvp8/lipo.txt
+          nm "$BIN" | grep -E 'LCTVMVP8TraceEvent|LCTVMVP7HOriginalMain' | tee out-mvp8/trace-symbols.txt
+          grep -F 'LEGACY_STAGE:' AppHost/MVP8Trace.m
+          grep -F 'HOST_MAIN_RETURN' AppHost/MVP8Main.m
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee out-mvp8/bundle-id.txt
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" | tee out-mvp8/executable.txt
+
+      - name: Package host template IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          APP='build-mvp8/Build/Products/Release-appletvos/LiveContainerTV.app'
+          PKG='out-mvp8/package/Payload'
+          rm -rf out-mvp8/package
+          mkdir -p "$PKG"
+          cp -R "$APP" "$PKG/"
+          (cd out-mvp8/package && zip -qry ../LiveContainerTV-MVP8-EntryTrace.ipa Payload)
+          shasum -a 256 out-mvp8/LiveContainerTV-MVP8-EntryTrace.ipa | tee out-mvp8/SHA256.txt
+
+      - name: Upload MVP8 entry trace
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainerTV-MVP8-EntryTrace
+          path: |
+            tvOS/ProbeMVP0/out-mvp8/LiveContainerTV-MVP8-EntryTrace.ipa
+            tvOS/ProbeMVP0/out-mvp8/SHA256.txt
+            tvOS/ProbeMVP0/out-mvp8/xcodebuild.log
+            tvOS/ProbeMVP0/out-mvp8/trace-symbols.txt
+          if-no-files-found: error
