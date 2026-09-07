@@ -41,6 +41,7 @@ targets:
           - MVP6Main.m
           - MVP7Main.m
           - MVP7CMain.m
+          - MVP7DMain.m
     dependencies:
       - target: GuestPayload
         embed: true
@@ -101,6 +102,25 @@ targets:
     sources:
       - path: AppHost/GuestRuntime.m
       - path: AppHost/MVP7CMain.m
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.livecontainertv.probe
+        PRODUCT_NAME: LiveContainerTV
+        INFOPLIST_FILE: AppHost/Info.plist
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+        TARGETED_DEVICE_FAMILY: "3"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        SUPPORTS_MACCATALYST: NO
+
+  LiveContainerTVMVP7D:
+    type: application
+    platform: tvOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: AppHost/GuestRuntime.m
+      - path: AppHost/MVP7DMain.m
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.livecontainertv.probe
