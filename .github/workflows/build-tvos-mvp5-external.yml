@@ -43,6 +43,7 @@ jobs:
       - name: Build external tvOS app unsigned
         run: |
           set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/tvOS/ProbeMVP0/out"
           cd /tmp/lctv-external-tvos
           xcodebuild \
             -project tvOS-Sample-Guide.xcodeproj \
