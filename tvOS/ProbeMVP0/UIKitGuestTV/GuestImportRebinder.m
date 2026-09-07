@@ -70,7 +70,10 @@ BOOL LCTVRebindGuestImport(const char *symbolName,
         const struct load_command *lc = (const struct load_command *)cursor;
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-            if (seg->fileoff == 0 && !textSegment) textSegment = seg;
+            // Do not use "first fileoff == 0" here: our MH_EXECUTE->MH_DYLIB
+            // patch keeps __PAGEZERO at fileoff 0 too. The ASLR slide must be
+            // anchored to the actual Mach-O header segment, __TEXT.
+            if (strncmp(seg->segname, SEG_TEXT, sizeof(seg->segname)) == 0) textSegment = seg;
             if (strncmp(seg->segname, SEG_LINKEDIT, sizeof(seg->segname)) == 0) linkeditSegment = seg;
         } else if (lc->cmd == LC_SYMTAB) {
             symtabCommand = (const struct symtab_command *)lc;
