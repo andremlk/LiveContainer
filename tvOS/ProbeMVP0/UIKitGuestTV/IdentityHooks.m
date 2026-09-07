@@ -1,4 +1,5 @@
 #import "IdentityHooks.h"
+#import "GuestImportRebinder.h"
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <UIKit/UIKit.h>
@@ -25,6 +26,8 @@ static NSString *gLCTVExpectedExecutablePath = nil;
 static NSString *gLCTVExpectedHomePath = nil;
 static NSString *gLCTVProbeStatus = nil;
 static BOOL gLCTVPreMainSetupOK = YES;
+static int (*gLCTVOriginalNSGetExecutablePath)(char *, uint32_t *) = NULL;
+static NSString *(*gLCTVOriginalNSHomeDirectory)(void) = NULL;
 
 __attribute__((visibility("default")))
 void LCTVSetIdentityProbeMode(int mode) {
@@ -50,9 +53,7 @@ static NSString *LCTVGuestFrameworkPath(void) {
 
 static NSBundle *LCTVGuestBundle(void) {
     NSString *frameworkPath = LCTVGuestFrameworkPath();
-    if (!frameworkPath) {
-        return nil;
-    }
+    if (!frameworkPath) return nil;
     return [NSBundle bundleWithPath:frameworkPath];
 }
 
@@ -72,22 +73,16 @@ static NSString *LCTVCurrentExecutablePath(void) {
 
 static NSString *LCTVCFMainBundleIdentifier(void) {
     CFBundleRef bundle = CFBundleGetMainBundle();
-    if (!bundle) {
-        return @"(nil)";
-    }
+    if (!bundle) return @"(nil)";
     CFStringRef identifier = CFBundleGetIdentifier(bundle);
     return identifier ? [(__bridge NSString *)identifier copy] : @"(nil)";
 }
 
 static NSString *LCTVCFMainBundlePath(void) {
     CFBundleRef bundle = CFBundleGetMainBundle();
-    if (!bundle) {
-        return @"(nil)";
-    }
+    if (!bundle) return @"(nil)";
     CFURLRef url = CFBundleCopyBundleURL(bundle);
-    if (!url) {
-        return @"(nil)";
-    }
+    if (!url) return @"(nil)";
     NSString *path = [(__bridge NSURL *)url path] ?: @"(nil)";
     CFRelease(url);
     return path;
@@ -96,20 +91,14 @@ static NSString *LCTVCFMainBundlePath(void) {
 static NSString *LCTVCFProgname(void) {
     typedef const char **(*CFGetPrognameFn)(void);
     CFGetPrognameFn fn = (CFGetPrognameFn)dlsym(RTLD_DEFAULT, "_CFGetProgname");
-    if (!fn) {
-        return @"(symbol unavailable)";
-    }
+    if (!fn) return @"(symbol unavailable)";
     const char **value = fn();
-    if (!value || !*value) {
-        return @"(nil)";
-    }
+    if (!value || !*value) return @"(nil)";
     return [NSString stringWithUTF8String:*value] ?: @"(invalid UTF-8)";
 }
 
 static NSBundle *LCTVMainBundleOverride(id self, SEL _cmd) {
-    if (gLCTVVirtualMainBundle) {
-        return gLCTVVirtualMainBundle;
-    }
+    if (gLCTVVirtualMainBundle) return gLCTVVirtualMainBundle;
     if (gLCTVOriginalMainBundleIMP) {
         NSBundle *(*original)(id, SEL) = (NSBundle *(*)(id, SEL))gLCTVOriginalMainBundleIMP;
         return original(self, _cmd);
@@ -147,26 +136,17 @@ static BOOL LCTVInstallNSBundleOverride(NSString **errorOut) {
 }
 
 static uint64_t LCTVAarch64GetTbnzJumpAddress(uint32_t instruction, uint64_t pc) {
-    if ((instruction & 0xFF000000) != 0x37000000) {
-        return 0;
-    }
+    if ((instruction & 0xFF000000) != 0x37000000) return 0;
     int64_t imm14 = (int64_t)((instruction >> 5) & 0x3FFF);
-    if (imm14 & 0x2000) {
-        imm14 |= ~0x3FFFLL;
-    }
+    if (imm14 & 0x2000) imm14 |= ~0x3FFFLL;
     return (uint64_t)((int64_t)pc + (imm14 << 2));
 }
 
 static uint64_t LCTVAarch64EmulateAdrp(uint32_t instruction, uint64_t pc) {
-    if ((instruction & 0x9F000000) != 0x90000000) {
-        return 0;
-    }
-
+    if ((instruction & 0x9F000000) != 0x90000000) return 0;
     int32_t immHiLo = (instruction & 0xFFFFE0) >> 3;
     immHiLo |= (instruction & 0x60000000) >> 29;
-    if (instruction & 0x800000) {
-        immHiLo |= 0xFFE00000;
-    }
+    if (instruction & 0x800000) immHiLo |= 0xFFE00000;
     int64_t imm = ((int64_t)immHiLo << 12);
     return (pc & ~(0xFFFULL)) + imm;
 }
@@ -175,15 +155,9 @@ static uint64_t LCTVAarch64EmulateAdrpLdr(uint32_t adrpInstruction,
                                           uint32_t ldrInstruction,
                                           uint64_t pc) {
     uint64_t adrpTarget = LCTVAarch64EmulateAdrp(adrpInstruction, pc);
-    if (!adrpTarget) {
-        return 0;
-    }
-    if ((adrpInstruction & 0x1F) != ((ldrInstruction >> 5) & 0x1F)) {
-        return 0;
-    }
-    if ((ldrInstruction & 0xFFC00000) != 0xF9400000) {
-        return 0;
-    }
+    if (!adrpTarget) return 0;
+    if ((adrpInstruction & 0x1F) != ((ldrInstruction >> 5) & 0x1F)) return 0;
+    if ((ldrInstruction & 0xFFC00000) != 0xF9400000) return 0;
     uint32_t imm12 = ((ldrInstruction >> 10) & 0xFFF) << 3;
     return adrpTarget + (uint64_t)imm12;
 }
@@ -197,9 +171,7 @@ static BOOL LCTVMakePointerWritable(void *address, NSString **errorOut) {
                                   FALSE,
                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
-        if (errorOut) {
-            *errorOut = [NSString stringWithFormat:@"vm_protect failed: %d", kr];
-        }
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"vm_protect failed: %d", kr];
         return NO;
     }
     return YES;
@@ -228,22 +200,16 @@ static BOOL LCTVInstallCFBundleOverride(NSString **errorOut) {
     for (NSUInteger i = 1; i < 160; i++) {
         uint32_t *pc = start + i;
         uint64_t branchAddress = LCTVAarch64GetTbnzJumpAddress(*pc, (uint64_t)pc);
-        if (!branchAddress) {
-            continue;
-        }
+        if (!branchAddress) continue;
 
         intptr_t distance = (intptr_t)branchAddress - (intptr_t)start;
-        if (distance < -0x10000 || distance > 0x10000 || (branchAddress & 3)) {
-            continue;
-        }
+        if (distance < -0x10000 || distance > 0x10000 || (branchAddress & 3)) continue;
 
         uint32_t branchInstruction = *(uint32_t *)(uintptr_t)branchAddress;
         uint64_t candidateAddress = LCTVAarch64EmulateAdrpLdr(*(pc - 1),
                                                                branchInstruction,
                                                                (uint64_t)(pc - 1));
-        if (!candidateAddress || (candidateAddress & (sizeof(void *) - 1))) {
-            continue;
-        }
+        if (!candidateAddress || (candidateAddress & (sizeof(void *) - 1))) continue;
 
         void **candidate = (void **)(uintptr_t)candidateAddress;
         if (*candidate == (void *)originalMain) {
@@ -272,107 +238,23 @@ static BOOL LCTVInstallCFBundleOverride(NSString **errorOut) {
     return ok;
 }
 
-typedef struct {
-    void *gap0[2];
-    char *mainExecutablePathOld;
-    void *gap18;
-    char *mainExecutablePath184;
-    size_t mainExecutablePathLengthNewer;
-} LCTVDyldConfig;
-
-typedef struct {
-    void *gap0;
-    LCTVDyldConfig *dyldConfig;
-} LCTVDyldAPI;
-
-static BOOL LCTVFindDyldVtableSlot(const char *functionName,
-                                   uint32_t initialOffset,
-                                   void ***slotOut,
-                                   NSString **errorOut) {
-    uint32_t *base = (uint32_t *)dlsym(RTLD_DEFAULT, functionName);
-    if (!base) {
-        if (errorOut) *errorOut = @"dlsym could not resolve dyld API stub";
-        return NO;
+// MVP4C v2: do not mutate dyld4 internals. Rebind only UIKitGuestTV's import slot.
+static int LCTVExecutablePathOverride(char *buf, uint32_t *bufsize) {
+    if (!gLCTVVirtualExecutableCString) {
+        return gLCTVOriginalNSGetExecutablePath ? gLCTVOriginalNSGetExecutablePath(buf, bufsize) : -1;
     }
 
-    uint32_t *scanStart = base + initialOffset;
-    uint32_t *adrp = NULL;
-    for (NSUInteger i = 0; i < 200; i++) {
-        uint32_t *cur = scanStart + i;
-        if ((*cur & 0x9F000000) != 0x90000000) continue;
-        if ((*(cur + 1) & 0xFFC00000) != 0xF9400000) continue;
-        if ((*(cur + 2) & 0xFFC00000) != 0xF9400000) continue;
-        adrp = cur;
-        break;
-    }
+    if (!bufsize) return -1;
+    size_t required = strlen(gLCTVVirtualExecutableCString) + 1;
+    if (required > UINT32_MAX) return -1;
 
-    if (!adrp) {
-        if (errorOut) *errorOut = @"dyld API adrp/ldr/ldr pattern not found";
-        return NO;
-    }
-
-    uint64_t gdyldAddress = LCTVAarch64EmulateAdrpLdr(*adrp, *(adrp + 1), (uint64_t)adrp);
-    if (!gdyldAddress) {
-        if (errorOut) *errorOut = @"could not resolve dyld4::gAPIs";
-        return NO;
-    }
-
-    void **dyldObject = *(void ***)(uintptr_t)gdyldAddress;
-    if (!dyldObject || !dyldObject[0]) {
-        if (errorOut) *errorOut = @"dyld4::gAPIs object/vtable is null";
-        return NO;
-    }
-    uint8_t *vtable = (uint8_t *)dyldObject[0];
-
-    uint32_t *selectorInstruction = adrp + 6;
-    void **slot = NULL;
-
-    if ((*selectorInstruction & 0x7F800000) == 0x52800000) {
-        uint32_t imm16 = (*selectorInstruction & 0x1FFFE0) >> 5;
-        slot = (void **)(vtable + imm16);
-    } else if ((*selectorInstruction & 0xFFE00C00) == 0xF8400C00) {
-        uint32_t imm9 = (*selectorInstruction & 0x1FF000) >> 12;
-        slot = (void **)(vtable + imm9);
-    } else {
-        uint32_t *ldr2 = adrp + 3;
-        if ((*ldr2 & 0xBFC00000) != 0xB9400000) {
-            if (errorOut) *errorOut = @"unsupported dyld vtable selector pattern";
-            return NO;
-        }
-        uint32_t size = (*ldr2 & 0xC0000000) >> 30;
-        uint32_t imm12 = (*ldr2 & 0x3FFC00) >> 10;
-        slot = (void **)(vtable + (imm12 << size));
-    }
-
-    if (!slot || !*slot) {
-        if (errorOut) *errorOut = @"resolved dyld vtable slot is null";
-        return NO;
-    }
-    if (slotOut) *slotOut = slot;
-    return YES;
-}
-
-static int LCTVExecutablePathMutationHook(LCTVDyldAPI *api, char *newPath, uint32_t *bufsize) {
-    (void)bufsize;
-    if (!api || !api->dyldConfig || !newPath) {
+    if (!buf || *bufsize < (uint32_t)required) {
+        *bufsize = (uint32_t)required;
         return -1;
     }
 
-    LCTVDyldConfig *config = api->dyldConfig;
-    char **pathSlot = NULL;
-    if (config->mainExecutablePathOld && config->mainExecutablePathOld[0] == '/') {
-        pathSlot = &config->mainExecutablePathOld;
-    } else if (config->mainExecutablePath184 && config->mainExecutablePath184[0] == '/') {
-        pathSlot = &config->mainExecutablePath184;
-    }
-    if (!pathSlot) {
-        return -2;
-    }
-
-    if (!LCTVMakePointerWritable(pathSlot, NULL)) {
-        return -3;
-    }
-    *pathSlot = newPath;
+    memcpy(buf, gLCTVVirtualExecutableCString, required);
+    *bufsize = (uint32_t)required;
     return 0;
 }
 
@@ -391,37 +273,36 @@ static BOOL LCTVInstallExecutablePathOverride(NSString **errorOut) {
         return NO;
     }
 
-    void **slot = NULL;
-    NSString *findError = nil;
-    if (!LCTVFindDyldVtableSlot("_NSGetExecutablePath", 2, &slot, &findError)) {
-        if (errorOut) *errorOut = findError;
+    NSUInteger reboundCount = 0;
+    NSString *rebindError = nil;
+    void *original = NULL;
+    BOOL rebound = LCTVRebindGuestImport("_NSGetExecutablePath",
+                                         (void *)&LCTVExecutablePathOverride,
+                                         &original,
+                                         &reboundCount,
+                                         &rebindError);
+    if (!rebound) {
+        if (errorOut) *errorOut = rebindError;
         return NO;
     }
-
-    void *original = *slot;
-    NSString *protectError = nil;
-    if (!LCTVMakePointerWritable(slot, &protectError)) {
-        if (errorOut) *errorOut = protectError;
-        return NO;
-    }
-    *slot = (void *)&LCTVExecutablePathMutationHook;
-
-    int mutationResult = _NSGetExecutablePath(gLCTVVirtualExecutableCString, NULL);
-    *slot = original;
-
-    if (mutationResult != 0) {
-        if (errorOut) {
-            *errorOut = [NSString stringWithFormat:@"dyld path mutation hook returned %d", mutationResult];
-        }
-        return NO;
+    if (!gLCTVOriginalNSGetExecutablePath && original) {
+        gLCTVOriginalNSGetExecutablePath = (int (*)(char *, uint32_t *))original;
     }
 
     NSString *observed = LCTVCurrentExecutablePath();
     BOOL ok = [observed isEqualToString:guestExecutable];
     if (!ok && errorOut) {
-        *errorOut = [NSString stringWithFormat:@"_NSGetExecutablePath still reports %@", observed];
+        *errorOut = [NSString stringWithFormat:@"guest import rebound=%lu but observed %@",
+                     (unsigned long)reboundCount, observed];
     }
     return ok;
+}
+
+// MVP4D v2: HOME is an environment value, while NSHomeDirectory is cached by Foundation.
+// Keep HOME/CFFIXED_USER_HOME and rebind only the guest's direct NSHomeDirectory import.
+static NSString *LCTVNSHomeDirectoryOverride(void) {
+    if (gLCTVExpectedHomePath) return gLCTVExpectedHomePath;
+    return gLCTVOriginalNSHomeDirectory ? gLCTVOriginalNSHomeDirectory() : @"/";
 }
 
 static BOOL LCTVPrepareHomeOverride(NSString **errorOut) {
@@ -451,7 +332,31 @@ static BOOL LCTVPrepareHomeOverride(NSString **errorOut) {
         if (errorOut) *errorOut = @"setenv(CFFIXED_USER_HOME) failed";
         return NO;
     }
-    return YES;
+
+    NSUInteger reboundCount = 0;
+    NSString *rebindError = nil;
+    void *original = NULL;
+    BOOL rebound = LCTVRebindGuestImport("NSHomeDirectory",
+                                         (void *)&LCTVNSHomeDirectoryOverride,
+                                         &original,
+                                         &reboundCount,
+                                         &rebindError);
+    if (!rebound) {
+        if (errorOut) *errorOut = rebindError;
+        return NO;
+    }
+    if (!gLCTVOriginalNSHomeDirectory && original) {
+        gLCTVOriginalNSHomeDirectory = (NSString *(*)(void))original;
+    }
+
+    const char *homeCString = getenv("HOME");
+    NSString *home = homeCString ? [NSString stringWithUTF8String:homeCString] : nil;
+    BOOL ok = [home isEqualToString:guestHome] && [NSHomeDirectory() isEqualToString:guestHome];
+    if (!ok && errorOut) {
+        *errorOut = [NSString stringWithFormat:@"guest import rebound=%lu; HOME=%@ NSHomeDirectory=%@",
+                     (unsigned long)reboundCount, home ?: @"(nil)", NSHomeDirectory() ?: @"(nil)"];
+    }
+    return ok;
 }
 
 static BOOL LCTVPrepareProcessNameOverride(NSString **errorOut) {
@@ -461,9 +366,7 @@ static BOOL LCTVPrepareProcessNameOverride(NSString **errorOut) {
     CFGetPrognameFn fn = (CFGetPrognameFn)dlsym(RTLD_DEFAULT, "_CFGetProgname");
     if (fn) {
         const char **slot = fn();
-        if (slot) {
-            *slot = strdup(LCTVExpectedProcessName.UTF8String);
-        }
+        if (slot) *slot = strdup(LCTVExpectedProcessName.UTF8String);
     }
 
     BOOL ok = [NSProcessInfo.processInfo.processName isEqualToString:LCTVExpectedProcessName];
@@ -481,8 +384,8 @@ void LCTVPrepareIdentityBeforeUIApplicationMain(void) {
         NSString *error = nil;
         BOOL ok = LCTVPrepareHomeOverride(&error);
         gLCTVPreMainSetupOK &= ok;
-        [messages addObject:ok ? @"HOME pre-main setup installed"
-                               : [NSString stringWithFormat:@"HOME pre-main setup failed: %@", error ?: @"unknown"]];
+        [messages addObject:ok ? @"HOME + NSHomeDirectory guest import v2 installed"
+                               : [NSString stringWithFormat:@"HOME v2 setup failed: %@", error ?: @"unknown"]];
     }
 
     if (LCTVModeIncludes(LCTVIdentityProbeModeProcessName)) {
@@ -493,9 +396,7 @@ void LCTVPrepareIdentityBeforeUIApplicationMain(void) {
                                : [NSString stringWithFormat:@"processName pre-main setup failed: %@", error ?: @"unknown"]];
     }
 
-    if (messages.count) {
-        gLCTVProbeStatus = [messages componentsJoinedByString:@"; "];
-    }
+    if (messages.count) gLCTVProbeStatus = [messages componentsJoinedByString:@"; "];
 }
 
 BOOL LCTVApplyIdentityAtDidFinishLaunching(void) {
@@ -522,14 +423,11 @@ BOOL LCTVApplyIdentityAtDidFinishLaunching(void) {
         NSString *error = nil;
         BOOL step = LCTVInstallExecutablePathOverride(&error);
         ok &= step;
-        [messages addObject:step ? @"_NSGetExecutablePath override installed"
-                                 : [NSString stringWithFormat:@"_NSGetExecutablePath override failed: %@", error ?: @"unknown"]];
+        [messages addObject:step ? @"_NSGetExecutablePath guest import v2 installed"
+                                 : [NSString stringWithFormat:@"_NSGetExecutablePath v2 failed: %@", error ?: @"unknown"]];
     }
 
-    if (gLCTVProbeStatus.length) {
-        [messages insertObject:gLCTVProbeStatus atIndex:0];
-    }
-
+    if (gLCTVProbeStatus.length) [messages insertObject:gLCTVProbeStatus atIndex:0];
     if (gLCTVProbeMode == LCTVIdentityProbeModeBaseline) {
         [messages addObject:@"baseline: no identity virtualization applied"];
     }
@@ -566,10 +464,10 @@ NSString *LCTVIdentityProbeTitle(void) {
         case LCTVIdentityProbeModeBaseline: return @"MVP3 PASS";
         case LCTVIdentityProbeModeNSBundle: return LCTVIdentityProbePassed() ? @"MVP4A PASS" : @"MVP4A FAIL";
         case LCTVIdentityProbeModeCFBundle: return LCTVIdentityProbePassed() ? @"MVP4B PASS" : @"MVP4B FAIL";
-        case LCTVIdentityProbeModeExecutablePath: return LCTVIdentityProbePassed() ? @"MVP4C PASS" : @"MVP4C FAIL";
-        case LCTVIdentityProbeModeHome: return LCTVIdentityProbePassed() ? @"MVP4D PASS" : @"MVP4D FAIL";
+        case LCTVIdentityProbeModeExecutablePath: return LCTVIdentityProbePassed() ? @"MVP4C2 PASS" : @"MVP4C2 FAIL";
+        case LCTVIdentityProbeModeHome: return LCTVIdentityProbePassed() ? @"MVP4D2 PASS" : @"MVP4D2 FAIL";
         case LCTVIdentityProbeModeProcessName: return LCTVIdentityProbePassed() ? @"MVP4E PASS" : @"MVP4E FAIL";
-        case LCTVIdentityProbeModeAll: return LCTVIdentityProbePassed() ? @"MVP4F ALL PASS" : @"MVP4F ALL FAIL";
+        case LCTVIdentityProbeModeAll: return LCTVIdentityProbePassed() ? @"MVP4F2 ALL PASS" : @"MVP4F2 ALL FAIL";
     }
     return @"IDENTITY PROBE";
 }
@@ -587,13 +485,13 @@ NSString *LCTVIdentityProbeExpectation(void) {
         case LCTVIdentityProbeModeCFBundle:
             return @"Only CFBundleGetMainBundle should identify UIKitGuestTV.framework.";
         case LCTVIdentityProbeModeExecutablePath:
-            return @"Only _NSGetExecutablePath should report Frameworks/UIKitGuestTV.framework/UIKitGuestTV.";
+            return @"MVP4C2: guest-scoped _NSGetExecutablePath import should report UIKitGuestTV without mutating dyld internals.";
         case LCTVIdentityProbeModeHome:
-            return @"HOME and NSHomeDirectory should point to an isolated guest Data directory.";
+            return @"MVP4D2: HOME and the guest NSHomeDirectory import should point to the isolated guest Data directory.";
         case LCTVIdentityProbeModeProcessName:
             return @"NSProcessInfo.processName should report UIKitGuestTV.";
         case LCTVIdentityProbeModeAll:
-            return @"NSBundle + CFBundle + executable path + HOME + processName should all identify the guest simultaneously.";
+            return @"MVP4F2: all identity hooks should identify the guest simultaneously using safe C/D import rebinding.";
     }
     return @"";
 }
