@@ -96,18 +96,20 @@ jobs:
           cp Tools/lctv_assemble_update.py "$KIT/Tools/"
           cp Tools/verify_macho.py "$KIT/Tools/"
 
-          # Hardware-discovered fix: AFC preflight must use the exact pairing file.
+          # Hardware-discovered fix: AFC preflight lives inside a nested shell string,
+          # so the quotes/dollar signs are escaped in the source file.
           python3 - "$KIT/bin/lctv" <<'PY'
           from pathlib import Path
           import sys
           p=Path(sys.argv[1])
           s=p.read_text()
-          old='plumesign check afc --ip "$ATV_IP" --port "$RSD_PORT" --udid "$UDID"'
-          new=old+' --pairing-file "$PAIRING_FILE"'
+          old=r'plumesign check afc --ip \"\$ATV_IP\" --port \"\$RSD_PORT\" --udid \"\$UDID\"'
+          new=old+r' --pairing-file \"\$PAIRING_FILE\"'
           if new not in s:
-              assert s.count(old) == 1, 'unexpected AFC preflight source'
+              assert s.count(old) == 1, f'unexpected AFC preflight source; matches={s.count(old)}'
               s=s.replace(old,new,1)
               p.write_text(s)
+          assert new in p.read_text(), 'pairing-file fix missing after patch'
           print('PAIRING-FILE PREFLIGHT FIX PASS')
           PY
 
