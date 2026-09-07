@@ -1,0 +1,143 @@
+name: tvOS tweak staging and preparation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-tweaks-prep]
+    paths:
+      - 'tvOS/ProbeMVP0/Tools/lctv_deb_stage.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_tweak_prepare.py'
+      - 'tvOS/ProbeMVP0/TweakProbe/**'
+      - '.github/workflows/test-tvos-tweak-prep.yml'
+
+concurrency:
+  group: tvos-tweak-prep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prep-selftest:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build native tvOS arm64 tweak probe
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf out/tweak-prep-test
+          mkdir -p out/tweak-prep-test/data/Library/MobileSubstrate/DynamicLibraries
+          mkdir -p out/tweak-prep-test/data/Library/Application\ Support/LCTVTest.bundle
+          mkdir -p out/tweak-prep-test/control
+
+          xcrun --sdk appletvos clang \
+            -target arm64-apple-tvos15.0 \
+            -dynamiclib TweakProbe/LCTVTestTweak.c \
+            -Wl,-install_name,@rpath/LCTVTestTweak.dylib \
+            -o out/tweak-prep-test/data/Library/MobileSubstrate/DynamicLibraries/LCTVTestTweak.dylib
+
+          cat > out/tweak-prep-test/data/Library/MobileSubstrate/DynamicLibraries/LCTVTestTweak.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>Filter</key>
+            <dict>
+              <key>Bundles</key>
+              <array><string>dev.livecontainertv.tinyguest</string></array>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+          printf 'probe-resource\n' > 'out/tweak-prep-test/data/Library/Application Support/LCTVTest.bundle/probe.txt'
+
+          cat > out/tweak-prep-test/control/control <<'CONTROL'
+          Package: dev.livecontainertv.testtweak
+          Name: LiveContainerTV Test Tweak
+          Version: 1.0
+          Architecture: iphoneos-arm64
+          Depends: mobilesubstrate
+          Description: Synthetic tvOS tweak used by LiveContainerTV CI
+          CONTROL
+
+      - name: Package synthetic Debian tweak
+        working-directory: tvOS/ProbeMVP0/out/tweak-prep-test
+        run: |
+          set -euo pipefail
+          printf '2.0\n' > debian-binary
+          tar -czf control.tar.gz -C control .
+          tar -czf data.tar.gz -C data .
+          /usr/bin/ar -rc LCTVTestTweak.deb debian-binary control.tar.gz data.tar.gz
+          test -s LCTVTestTweak.deb
+
+      - name: Analyze package
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_deb_analyze.py \
+            out/tweak-prep-test/LCTVTestTweak.deb \
+            --json-out out/tweak-prep-test/analyze.json
+
+      - name: Safely stage package
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_deb_stage.py \
+            out/tweak-prep-test/LCTVTestTweak.deb \
+            out/tweak-prep-test/staged \
+            --manifest out/tweak-prep-test/stage.json
+          test -f out/tweak-prep-test/staged/Library/MobileSubstrate/DynamicLibraries/LCTVTestTweak.dylib
+          test -f 'out/tweak-prep-test/staged/Library/Application Support/LCTVTest.bundle/probe.txt'
+
+      - name: Verify traversal rejection
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          p = Path('Tools/lctv_deb_stage.py')
+          spec = importlib.util.spec_from_file_location('stage', p)
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+          try:
+              m.safe_relative('../escape')
+          except m.DebStageError:
+              print('TRAVERSAL REJECTION PASS')
+          else:
+              raise SystemExit('unsafe traversal path was accepted')
+          PY
+
+      - name: Prepare and classify staged tweak
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_tweak_prepare.py \
+            out/tweak-prep-test/staged \
+            --output out/tweak-prep-test/prepared \
+            --report out/tweak-prep-test/prepare.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r = json.loads(Path('out/tweak-prep-test/prepare.json').read_text())
+          assert r['summary']['mach_o_objects'] == 1, r
+          assert r['summary']['ready_or_experimental'] == 1, r
+          assert r['summary']['rejected'] == 0, r
+          obj = r['objects'][0]
+          assert obj['arch'] == 'arm64', obj
+          assert obj['platform'] == 'tvOS', obj
+          assert obj['status'] == 'ready', obj
+          assert 'Library/MobileSubstrate/DynamicLibraries/LCTVTestTweak.dylib' in r['sign_queue'], r
+          assert r['filters'][0]['bundles'] == ['dev.livecontainertv.tinyguest'], r
+          print('TWEAK PREP SELFTEST PASS')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tvOS-Tweak-Prep-Selftest
+          path: |
+            tvOS/ProbeMVP0/out/tweak-prep-test/LCTVTestTweak.deb
+            tvOS/ProbeMVP0/out/tweak-prep-test/analyze.json
+            tvOS/ProbeMVP0/out/tweak-prep-test/stage.json
+            tvOS/ProbeMVP0/out/tweak-prep-test/prepare.json
+            tvOS/ProbeMVP0/out/tweak-prep-test/prepared/**
