@@ -9,6 +9,10 @@ on:
       - '.github/workflows/ipatool-tv.yml'
   workflow_dispatch:
 
+concurrency:
+  group: ipatool-tv-mvp-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-tvos:
     name: Build unsigned tvOS IPA
