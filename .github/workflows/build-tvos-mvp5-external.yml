@@ -7,10 +7,10 @@ on:
     paths:
       - 'tvOS/ProbeMVP0/**'
       - '.github/workflows/build-tvos-mvp5-external.yml'
-  pull_request:
-    paths:
-      - 'tvOS/ProbeMVP0/**'
-      - '.github/workflows/build-tvos-mvp5-external.yml'
+
+concurrency:
+  group: tvos-mvp5-external-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   external-candidate:
