@@ -286,13 +286,47 @@ static int LCTVBootUIKitGuestColdStart(int argc, char *argv[], NSInteger identit
     NSBundle *guestBundleBeforeHooks = [NSBundle bundleWithPath:guestBundlePath];
     NSString *guestBundleID = guestBundleBeforeHooks.bundleIdentifier ?: @"dev.livecontainertv.uikitguest.patched";
     NSString *guestProcessName = guestBundleBeforeHooks.infoDictionary[@"CFBundleExecutable"] ?: @"UIKitGuestTV";
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+
+    NSString *hostPreMainHome = nil;
+    BOOL hostPreMainPreOK = YES;
+    if (identityMode == LCTVIdentityProbeModeHostPreMain) {
+        const char *hostHomeCString = getenv("HOME");
+        if (!hostHomeCString) {
+            if (errorOut) *errorOut = @"host HOME unavailable before MVP5P bootstrap";
+            return INT_MIN;
+        }
+        NSString *hostHome = [NSString stringWithUTF8String:hostHomeCString];
+        hostPreMainHome = [hostHome stringByAppendingPathComponent:@"Library/Caches/LiveContainerTV/Guests/UIKitGuestTVHostBootstrap/Data"];
+
+        setenv("LCTV_HOST_PREMAIN_PROBE", "1", 1);
+        setenv("LCTV_HOST_EXPECTED_BUNDLE_ID", guestBundleID.UTF8String, 1);
+        setenv("LCTV_HOST_EXPECTED_EXEC_PATH", guestPath.fileSystemRepresentation, 1);
+        setenv("LCTV_HOST_EXPECTED_HOME", hostPreMainHome.fileSystemRepresentation, 1);
+        setenv("LCTV_HOST_EXPECTED_PROCESS", guestProcessName.UTF8String, 1);
+
+        [defaults setObject:@"MVP5P STARTED: applying host identity before guest dlopen"
+                      forKey:LCTVLastMVP3ResultKey];
+        [defaults synchronize];
+
+        NSString *preError = nil;
+        hostPreMainPreOK = LCTVPrepareHostGuestIdentityBeforeLoad(guestBundlePath,
+                                                                  guestPath,
+                                                                  guestBundleID,
+                                                                  guestProcessName,
+                                                                  hostPreMainHome,
+                                                                  &preError);
+        if (preError.length) setenv("LCTV_HOST_PRELOAD_ERROR", preError.UTF8String, 1);
+    }
 
     dlerror();
     void *handle = dlopen(guestPath.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
         const char *error = dlerror();
         if (errorOut) *errorOut = [NSString stringWithFormat:@"dlopen failed: %s", error ?: "unknown error"];
-        return INT_MIN;
+        // In MVP5P the host identity is already mutated. Exit the one-shot
+        // process instead of trying to start the host UIApplicationMain under it.
+        return identityMode == LCTVIdentityProbeModeHostPreMain ? 1 : INT_MIN;
     }
 
     dlerror();
@@ -302,13 +336,13 @@ static int LCTVBootUIKitGuestColdStart(int argc, char *argv[], NSInteger identit
     if (!markerFn || markerError) {
         if (errorOut) *errorOut = [NSString stringWithFormat:@"UIKit guest marker lookup failed: %s", markerError ?: "symbol missing"];
         dlclose(handle);
-        return INT_MIN;
+        return identityMode == LCTVIdentityProbeModeHostPreMain ? 1 : INT_MIN;
     }
     const char *markerResult = markerFn();
     if (!markerResult || strcmp(markerResult, "UIKitGuestTV/tvOS") != 0) {
         if (errorOut) *errorOut = [NSString stringWithFormat:@"unexpected UIKit guest marker: %s", markerResult ?: "NULL"];
         dlclose(handle);
-        return INT_MIN;
+        return identityMode == LCTVIdentityProbeModeHostPreMain ? 1 : INT_MIN;
     }
 
     dlerror();
@@ -318,7 +352,7 @@ static int LCTVBootUIKitGuestColdStart(int argc, char *argv[], NSInteger identit
     if (!setIdentityMode || modeError) {
         if (errorOut) *errorOut = [NSString stringWithFormat:@"identity mode setter lookup failed: %s", modeError ?: "symbol missing"];
         dlclose(handle);
-        return INT_MIN;
+        return identityMode == LCTVIdentityProbeModeHostPreMain ? 1 : INT_MIN;
     }
 
     const struct mach_header_64 *guestHeader = NULL;
@@ -337,41 +371,23 @@ static int LCTVBootUIKitGuestColdStart(int argc, char *argv[], NSInteger identit
     if (!guestMain) {
         if (errorOut) *errorOut = resolveError ?: @"entry point resolution failed";
         dlclose(handle);
-        return INT_MIN;
+        return identityMode == LCTVIdentityProbeModeHostPreMain ? 1 : INT_MIN;
     }
 
-    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    [defaults setObject:[NSString stringWithFormat:@"%@ STARTED: jumping to guest LC_MAIN (entryoff=0x%llx)", LCTVIdentityModeName(identityMode), (unsigned long long)entryOffset]
-                  forKey:LCTVLastMVP3ResultKey];
-    [defaults synchronize];
-
     if (identityMode == LCTVIdentityProbeModeHostPreMain) {
-        const char *hostHomeCString = getenv("HOME");
-        if (!hostHomeCString) {
-            if (errorOut) *errorOut = @"host HOME unavailable before MVP5P bootstrap";
-            dlclose(handle);
-            return INT_MIN;
-        }
-        NSString *hostHome = [NSString stringWithUTF8String:hostHomeCString];
-        NSString *guestHome = [hostHome stringByAppendingPathComponent:@"Library/Caches/LiveContainerTV/Guests/UIKitGuestTVHostBootstrap/Data"];
-
-        setenv("LCTV_HOST_PREMAIN_PROBE", "1", 1);
-        setenv("LCTV_HOST_EXPECTED_BUNDLE_ID", guestBundleID.UTF8String, 1);
-        setenv("LCTV_HOST_EXPECTED_EXEC_PATH", guestPath.fileSystemRepresentation, 1);
-        setenv("LCTV_HOST_EXPECTED_HOME", guestHome.fileSystemRepresentation, 1);
-        setenv("LCTV_HOST_EXPECTED_PROCESS", guestProcessName.UTF8String, 1);
-
-        NSString *runtimeError = nil;
-        (void)LCTVApplyHostGuestIdentity(guestHeader,
-                                         guestBundlePath,
-                                         guestPath,
-                                         guestBundleID,
-                                         guestProcessName,
-                                         guestHome,
-                                         &runtimeError);
-        // Even a partial setup continues into the observation-only guest. It will
-        // render a red diagnostic screen with the exact identity snapshot instead
-        // of dropping back to the host and hiding the failure point.
+        NSString *postError = nil;
+        BOOL postOK = LCTVFinishHostGuestIdentityAfterLoad(guestHeader, &postError);
+        setenv("LCTV_HOST_PREMAIN_PRE_OK", hostPreMainPreOK ? "1" : "0", 1);
+        setenv("LCTV_HOST_PREMAIN_POST_OK", postOK ? "1" : "0", 1);
+        if (postError.length) setenv("LCTV_HOST_POSTLOAD_ERROR", postError.UTF8String, 1);
+        // Continue even after a partial hook setup. The observation-only guest
+        // renders a red screen with the exact identity snapshot.
+    } else {
+        [defaults setObject:[NSString stringWithFormat:@"%@ STARTED: jumping to guest LC_MAIN (entryoff=0x%llx)",
+                             LCTVIdentityModeName(identityMode),
+                             (unsigned long long)entryOffset]
+                      forKey:LCTVLastMVP3ResultKey];
+        [defaults synchronize];
     }
 
     int result = guestMain(argc, argv);
@@ -395,17 +411,39 @@ static int LCTVBootExternalGuestColdStart(int argc, char *argv[], NSString **err
     NSString *processName = guestBundle.infoDictionary[@"CFBundleExecutable"] ?: guestPath.lastPathComponent;
     NSString *bundlePath = guestBundle.bundlePath;
 
+    const char *hostHomeCString = getenv("HOME");
+    if (!hostHomeCString) {
+        if (errorOut) *errorOut = @"host HOME unavailable before external bootstrap";
+        return INT_MIN;
+    }
+    NSString *hostHome = [NSString stringWithUTF8String:hostHomeCString];
+    NSString *safeID = [bundleID stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    NSString *guestHome = [hostHome stringByAppendingPathComponent:[NSString stringWithFormat:@"Library/Caches/LiveContainerTV/Guests/%@/Data", safeID]];
+
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    [defaults setObject:[NSString stringWithFormat:@"MVP5C STARTED: dlopen external guest %@", processName]
+    [defaults setObject:[NSString stringWithFormat:@"MVP5C STARTED: applying host identity before dlopen (%@)", processName]
                   forKey:LCTVLastMVP3ResultKey];
     [defaults synchronize];
+
+    unsetenv("LCTV_HOST_PREMAIN_PROBE");
+    NSString *preError = nil;
+    BOOL preOK = LCTVPrepareHostGuestIdentityBeforeLoad(bundlePath,
+                                                         guestPath,
+                                                         bundleID,
+                                                         processName,
+                                                         guestHome,
+                                                         &preError);
+    setenv("LCTV_MVP5_EXTERNAL_PRE_OK", preOK ? "1" : "0", 1);
+    if (preError.length) setenv("LCTV_MVP5_EXTERNAL_PRE_ERROR", preError.UTF8String, 1);
 
     dlerror();
     void *handle = dlopen(guestPath.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
         const char *error = dlerror();
         if (errorOut) *errorOut = [NSString stringWithFormat:@"external dlopen failed: %s", error ?: "unknown error"];
-        return INT_MIN;
+        // Host identity has already been changed. Terminate this one-shot launch
+        // rather than starting the host UI under the guest identity.
+        return 1;
     }
 
     const struct mach_header_64 *guestHeader = NULL;
@@ -415,35 +453,13 @@ static int LCTVBootExternalGuestColdStart(int argc, char *argv[], NSString **err
     if (!guestMain) {
         if (errorOut) *errorOut = resolveError ?: @"external LC_MAIN resolution failed";
         dlclose(handle);
-        return INT_MIN;
+        return 1;
     }
 
-    [defaults setObject:[NSString stringWithFormat:@"MVP5C STARTED: external dlopen PASS; LC_MAIN=0x%llx; applying host identity",
-                         (unsigned long long)entryOffset]
-                  forKey:LCTVLastMVP3ResultKey];
-    [defaults synchronize];
-
-    const char *hostHomeCString = getenv("HOME");
-    if (!hostHomeCString) {
-        if (errorOut) *errorOut = @"host HOME unavailable before external bootstrap";
-        dlclose(handle);
-        return INT_MIN;
-    }
-    NSString *hostHome = [NSString stringWithUTF8String:hostHomeCString];
-    NSString *safeID = [bundleID stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
-    NSString *guestHome = [hostHome stringByAppendingPathComponent:[NSString stringWithFormat:@"Library/Caches/LiveContainerTV/Guests/%@/Data", safeID]];
-
-    unsetenv("LCTV_HOST_PREMAIN_PROBE");
-    NSString *runtimeError = nil;
-    BOOL runtimeOK = LCTVApplyHostGuestIdentity(guestHeader,
-                                                 bundlePath,
-                                                 guestPath,
-                                                 bundleID,
-                                                 processName,
-                                                 guestHome,
-                                                 &runtimeError);
-    setenv("LCTV_MVP5_EXTERNAL_RUNTIME_OK", runtimeOK ? "1" : "0", 1);
-    if (runtimeError.length) setenv("LCTV_MVP5_EXTERNAL_RUNTIME_ERROR", runtimeError.UTF8String, 1);
+    NSString *postError = nil;
+    BOOL postOK = LCTVFinishHostGuestIdentityAfterLoad(guestHeader, &postError);
+    setenv("LCTV_MVP5_EXTERNAL_POST_OK", postOK ? "1" : "0", 1);
+    if (postError.length) setenv("LCTV_MVP5_EXTERNAL_POST_ERROR", postError.UTF8String, 1);
 
     if (argc > 0 && argv) argv[0] = (char *)guestPath.fileSystemRepresentation;
     int result = guestMain(argc, argv);
@@ -551,6 +567,7 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 
 - (void)armMode:(LCTVIdentityProbeMode)mode {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults removeObjectForKey:LCTVBootExternalGuestNextLaunchKey];
     [defaults setBool:YES forKey:LCTVBootUIKitGuestNextLaunchKey];
     [defaults setInteger:mode forKey:LCTVIdentityProbeModeNextLaunchKey];
     NSString *message = [NSString stringWithFormat:@"%@ ARMED: force-close LiveContainerTV, then reopen it. This mode is one-shot.", LCTVIdentityModeName(mode)];
@@ -570,6 +587,8 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 - (void)armExternalGuest:(id)sender {
     (void)sender;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults removeObjectForKey:LCTVBootUIKitGuestNextLaunchKey];
+    [defaults removeObjectForKey:LCTVIdentityProbeModeNextLaunchKey];
     [defaults setBool:YES forKey:LCTVBootExternalGuestNextLaunchKey];
     NSString *message = @"MVP5C EXTERNAL ARMED: force-close LiveContainerTV, then reopen it. This mode is one-shot.";
     [defaults setObject:message forKey:LCTVLastMVP3ResultKey];
