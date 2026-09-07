@@ -60,7 +60,7 @@ jobs:
           assert report['macho']['filetype_name'] == 'MH_EXECUTE', report
           assert report['macho']['lc_main'], report
           assert not report['macho']['encrypted'], report
-          assert len(report.get('frameworks', [])) >= 1, report
+          assert len(report.get('embedded', {}).get('frameworks', [])) >= 1, report
           print('MVP7F ANALYZE PASS:', report['app']['display_name'], report['app']['bundle_id'])
           PY
 
