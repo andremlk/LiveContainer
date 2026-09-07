@@ -10,7 +10,7 @@
 
 static NSString * const LCTVSelectedGuestNextLaunchKey = @"LCTVSelectedGuestNextLaunch";
 static NSString * const LCTVLastMVP7ResultKey = @"LCTVLastMVP7Result";
-static NSString * const LCTVGuestStoreRelativePath = @"Library/Application Support/LiveContainerTV/GuestStore";
+static NSString * const LCTVGuestStoreRelativePath = @"Library/Caches/LiveContainerTV/GuestStore";
 
 typedef int (*LCTVGuestMainFn)(int, char **);
 
@@ -439,7 +439,7 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
 
     UILabel *subtitle = [[UILabel alloc] init];
     subtitle.translatesAutoresizingMaskIntoConstraints = NO;
-    subtitle.text = @"Writable Guest Store — prepared apps execute from Library/Application Support";
+    subtitle.text = @"Writable Guest Store — prepared apps execute from Library/Caches";
     subtitle.textColor = UIColor.lightGrayColor;
     subtitle.font = [UIFont systemFontOfSize:24.0];
     subtitle.textAlignment = NSTextAlignmentCenter;
