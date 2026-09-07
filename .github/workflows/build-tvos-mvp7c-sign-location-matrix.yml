@@ -1,0 +1,155 @@
+name: MVP7C tvOS Code-Sign Location Matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7CMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/Tools/**'
+      - 'tvOS/ProbeMVP0/project.yml'
+      - '.github/workflows/build-tvos-mvp7c-sign-location-matrix.yml'
+
+concurrency:
+  group: tvos-mvp7c-sign-location-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build LiveContainerTV Mach-O patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p build-tools out
+          xcrun clang -std=c11 -Wall -Wextra -Werror \
+            Tools/lctv_macho_patch.c \
+            -o build-tools/lctv_macho_patch
+
+      - name: Build pinned Sample Guide control IPA
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/lctv-mvp7c-sample
+          git clone --quiet https://github.com/abdulkarimkhaan/tvOS-sample-guide.git /tmp/lctv-mvp7c-sample
+          cd /tmp/lctv-mvp7c-sample
+          git checkout --quiet e1a672c59e2d3045542e351d326aa7642c4fa895
+
+          OUT="$GITHUB_WORKSPACE/tvOS/ProbeMVP0/out"
+          xcodebuild \
+            -project tvOS-Sample-Guide.xcodeproj \
+            -scheme tvOS-Sample-Guide \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$OUT/mvp7c-sample-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee "$OUT/mvp7c-sample-xcodebuild.log"
+
+          PRODUCTS="$OUT/mvp7c-sample-derived/Build/Products/Release-appletvos"
+          APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          test -n "$APP"
+          rm -rf "$OUT/mvp7c-sample-ipa"
+          mkdir -p "$OUT/mvp7c-sample-ipa/Payload"
+          cp -R "$APP" "$OUT/mvp7c-sample-ipa/Payload/"
+          (cd "$OUT/mvp7c-sample-ipa" && zip -qry ../MVP7C-Sample-Guide.ipa Payload)
+          test -f "$OUT/MVP7C-Sample-Guide.ipa"
+
+      - name: Analyze and prepare signed-bundle control guest
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_ipa_analyze.py \
+            out/MVP7C-Sample-Guide.ipa \
+            --json-out out/MVP7C-Sample-analysis.json | tee out/MVP7C-Sample-analysis.txt
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('out/MVP7C-Sample-analysis.json').read_text())
+          assert report['compatible_for_mvp5'] is True, report
+          assert report['macho']['arm64'] is True, report
+          assert report['macho']['filetype_name'] == 'MH_EXECUTE', report
+          assert report['macho']['lc_main'], report
+          assert not report['macho']['encrypted'], report
+          print('MVP7C ANALYZE PASS:', report['app']['display_name'], report['app']['bundle_id'])
+          PY
+
+          chmod +x Tools/lctv_prepare_ipa.sh
+          LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
+            bash Tools/lctv_prepare_ipa.sh \
+              out/MVP7C-Sample-Guide.ipa \
+              out/mvp7c-sample-prepared
+          python3 Tools/lctv_wrap_guest_framework.py \
+            out/mvp7c-sample-prepared \
+            out/MatrixGuest.framework
+
+      - name: Build MVP7C host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme LiveContainerTVMVP7C \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7c-host \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp7c-host-xcodebuild.log
+
+      - name: Verify location matrix source and stage control guest
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          grep -q 'mode:@"direct"' AppHost/MVP7CMain.m
+          grep -q 'mode:@"symlink"' AppHost/MVP7CMain.m
+          grep -q 'mode:@"copy"' AppHost/MVP7CMain.m
+          grep -q 'mode:@"hybrid"' AppHost/MVP7CMain.m
+          grep -q 'createSymbolicLinkAtPath' AppHost/MVP7CMain.m
+          grep -q 'copyItemAtPath' AppHost/MVP7CMain.m
+          grep -q 'bytesEqual' AppHost/MVP7CMain.m
+
+          HOST='build-mvp7c-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          test -d "$HOST"
+          mkdir -p "$HOST/Frameworks"
+          cp -R out/MatrixGuest.framework "$HOST/Frameworks/MatrixGuest.framework"
+
+          INFO="$HOST/Frameworks/MatrixGuest.framework/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LCTVPreparedGuest' "$INFO")" = 'true'
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO")"
+          python3 Tools/verify_macho.py "$HOST/Frameworks/MatrixGuest.framework/$EXEC" | tee out/MVP7C-Guest-Verify.txt
+          echo 'MVP7C MATRIX FIXTURE PASS' | tee out/MVP7C-Matrix.txt
+
+      - name: Package MVP7C diagnostic IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7c-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out/mvp7c-host-ipa
+          mkdir -p out/mvp7c-host-ipa/Payload
+          cp -R "$HOST" out/mvp7c-host-ipa/Payload/
+          (cd out/mvp7c-host-ipa && zip -qry ../LiveContainerTV-MVP7C-SignLocationMatrix.ipa Payload)
+          test -f out/LiveContainerTV-MVP7C-SignLocationMatrix.ipa
+          shasum -a 256 out/LiveContainerTV-MVP7C-SignLocationMatrix.ipa | tee out/MVP7C-IPA-SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MVP7C-CodeSign-Location-Matrix
+          path: |
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP7C-SignLocationMatrix.ipa
+            tvOS/ProbeMVP0/out/MVP7C-IPA-SHA256.txt
+            tvOS/ProbeMVP0/out/MVP7C-Matrix.txt
+            tvOS/ProbeMVP0/out/MVP7C-Guest-Verify.txt
+            tvOS/ProbeMVP0/out/MVP7C-Sample-analysis.json
+            tvOS/ProbeMVP0/out/mvp7c-host-xcodebuild.log
