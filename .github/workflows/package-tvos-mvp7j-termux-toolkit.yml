@@ -1,0 +1,161 @@
+name: MVP7J Termux Toolkit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/Termux/**'
+      - 'tvOS/ProbeMVP0/Tools/**'
+      - '.github/workflows/package-tvos-mvp7j-termux-toolkit.yml'
+
+concurrency:
+  group: tvos-mvp7j-termux-toolkit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          bash -n Termux/lctv
+          bash -n Termux/lctv-rebase
+
+      - name: Synthetic preservation test for host rebase
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          ROOT="$PWD/out/mvp7j-rebase-test"
+          HOME_TEST="$ROOT/home"
+          CUR="$ROOT/current/Payload/LiveContainerTV.app"
+          TPL="$ROOT/template/Payload/LiveContainerTV.app"
+          rm -rf "$ROOT"
+          mkdir -p "$CUR/Frameworks/com.example.guest.code.framework" \
+                   "$CUR/GuestSeeds/com.example.guest.resources.lctvseed" \
+                   "$TPL" \
+                   "$HOME_TEST/.local/share/livecontainertv"
+
+          python3 - "$CUR" "$TPL" <<'PY'
+          import json, plistlib, sys
+          from pathlib import Path
+          cur, tpl = map(Path, sys.argv[1:])
+          for app in (cur, tpl):
+              (app / 'Info.plist').write_bytes(plistlib.dumps({
+                  'CFBundleIdentifier': 'dev.livecontainertv.probe',
+                  'CFBundleExecutable': 'LiveContainerTV',
+                  'CFBundlePackageType': 'APPL',
+              }))
+          (cur / 'LiveContainerTV').write_bytes(b'OLD-HOST')
+          (tpl / 'LiveContainerTV').write_bytes(b'\x7fELF fake MVP7J JIT Run JIT memory probe')
+          fw = cur / 'Frameworks/com.example.guest.code.framework'
+          (fw / 'Info.plist').write_bytes(plistlib.dumps({
+              'CFBundleExecutable': 'guest',
+              'CFBundlePackageType': 'FMWK',
+              'LCTVCodeSlot': True,
+          }))
+          (fw / 'guest').write_bytes(b'SIGNED-GUEST-CODE')
+          seed = cur / 'GuestSeeds/com.example.guest.resources.lctvseed'
+          (seed / 'Info.plist').write_bytes(plistlib.dumps({'LCTVResourceSeed': True}))
+          (seed / 'resource.txt').write_text('preserve me')
+          (cur / 'LCTVImportCatalog.json').write_text(json.dumps({'guests':[{'bundleID':'com.example.guest'}]}, sort_keys=True))
+          PY
+
+          chmod +x "$CUR/LiveContainerTV" "$TPL/LiveContainerTV"
+          (cd "$ROOT/current" && zip -qry "$HOME_TEST/.local/share/livecontainertv/current.ipa" Payload)
+          (cd "$ROOT/template" && zip -qry "$ROOT/MVP7J-HostTemplate.ipa" Payload)
+
+          HOME="$HOME_TEST" \
+          LCTV_OUTPUT_DIR="$ROOT" \
+          bash Termux/lctv-rebase "$ROOT/MVP7J-HostTemplate.ipa" "$ROOT/Rebased.ipa" | tee "$ROOT/rebase.log"
+
+          grep -F 'MVP7J REBASE PACKAGE PASS' "$ROOT/rebase.log"
+          grep -F 'preserved codeSlots= 1' "$ROOT/rebase.log"
+          grep -F 'preserved guestSeeds= 1' "$ROOT/rebase.log"
+
+      - name: Package toolkit
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          KIT='out/mvp7j-toolkit/LiveContainerTV-Termux'
+          rm -rf out/mvp7j-toolkit
+          mkdir -p "$KIT/bin" "$KIT/Tools"
+          cp Termux/lctv "$KIT/bin/lctv"
+          cp Termux/lctv-rebase "$KIT/bin/lctv-rebase"
+          cp Termux/termux.conf.example "$KIT/termux.conf.example"
+          cp Tools/lctv_macho_patch.py "$KIT/Tools/"
+          cp Tools/lctv_registry_from_host.py "$KIT/Tools/"
+          cp Tools/lctv_ipa_analyze.py "$KIT/Tools/"
+          cp Tools/lctv_prepare_ipa.sh "$KIT/Tools/"
+          cp Tools/lctv_split_guest.py "$KIT/Tools/"
+          cp Tools/lctv_import_guest.py "$KIT/Tools/"
+          cp Tools/lctv_assemble_update.py "$KIT/Tools/"
+          cp Tools/verify_macho.py "$KIT/Tools/"
+
+          # Hardware-discovered fix: AFC preflight must use the exact pairing file.
+          python3 - "$KIT/bin/lctv" <<'PY'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1])
+          s=p.read_text()
+          old='plumesign check afc --ip "$ATV_IP" --port "$RSD_PORT" --udid "$UDID"'
+          new=old+' --pairing-file "$PAIRING_FILE"'
+          if new not in s:
+              assert s.count(old) == 1, 'unexpected AFC preflight source'
+              s=s.replace(old,new,1)
+              p.write_text(s)
+          print('PAIRING-FILE PREFLIGHT FIX PASS')
+          PY
+
+          chmod +x "$KIT/bin/lctv" "$KIT/bin/lctv-rebase"
+          bash -n "$KIT/bin/lctv"
+          bash -n "$KIT/bin/lctv-rebase"
+
+          cat > "$KIT/README.txt" <<'EOF'
+          LiveContainerTV MVP7J Termux toolkit
+
+          Dependencies:
+            pkg install python zip unzip dnsutils proot-distro
+
+          IMPORTANT INSTALL IDENTITY RULE:
+            LCTV_CUSTOM_IDENTIFIER is the OUTER signing identity already installed
+            on Apple TV. It is NOT the unsigned template CFBundleIdentifier.
+            Current hardware-tested value: dev.andre.livecontainertv.mvp3
+
+          Existing workflow:
+            bin/lctv doctor
+            bin/lctv init /sdcard/Download/<current-LiveContainerTV.ipa>
+            bin/lctv add /sdcard/Download/<guest.ipa>
+            bin/lctv install /sdcard/Download/<update.ipa>
+
+          New MVP7J host upgrade without losing imported guests:
+            bin/lctv-rebase /sdcard/Download/LiveContainerTV-MVP7J-JIT-HostTemplate.ipa \
+              /sdcard/Download/LiveContainerTV-MVP7J-Rebased.ipa
+
+          lctv-rebase replaces only the outer host executable and verifies that
+          CodeSlots, GuestSeeds and LCTVImportCatalog.json are preserved exactly.
+          Sign/install the rebased IPA with the SAME outer bundle ID.
+
+          Hardware fixes included:
+            - SC_Info stripped from writable resource seeds
+            - duplicate @loader_path/Frameworks RPATH generation avoided
+            - transform-version fingerprints
+            - AFC preflight passes --pairing-file
+          EOF
+
+          (cd out/mvp7j-toolkit && zip -qry ../MVP7J-Termux-Toolkit.zip LiveContainerTV-Termux)
+          sha256sum out/MVP7J-Termux-Toolkit.zip | tee out/MVP7J-Termux-Toolkit-SHA256.txt
+
+      - name: Upload toolkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: MVP7J-Termux-Toolkit
+          path: |
+            tvOS/ProbeMVP0/out/MVP7J-Termux-Toolkit.zip
+            tvOS/ProbeMVP0/out/MVP7J-Termux-Toolkit-SHA256.txt
+            tvOS/ProbeMVP0/out/mvp7j-rebase-test/rebase.log
+          if-no-files-found: error
