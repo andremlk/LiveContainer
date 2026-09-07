@@ -73,6 +73,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       PREFIX: /tmp
+      TMPDIR: /tmp
       LCTV_OUTPUT_DIR: /tmp/lctv-output
       LCTV_STATE_DIR: /tmp/lctv-state
     steps:
@@ -161,7 +162,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY' | tee out/mvp7i-linux/container-verification.txt
-          import json, plistlib, zipfile
+          import json, zipfile
           from pathlib import Path
           ipa=Path('out/mvp7i-linux/LiveContainerTV-Termux-Nuvio.ipa')
           with zipfile.ZipFile(ipa) as z:
@@ -179,7 +180,6 @@ jobs:
               assert slot+g['executable'] in names
               assert seed+g['executable'] not in names
               assert not any(n.startswith(seed+'Frameworks/') for n in names)
-              nested={n.split('/')[4] for n in names if n.startswith(slot+'Frameworks/') and n.endswith('.framework/')}
               print('bundleID=', g['bundleID'])
               print('frameworks(metadata)=', g['nestedFrameworks'])
               print('update=', update['counts'])
