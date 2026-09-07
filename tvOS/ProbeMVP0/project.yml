@@ -37,9 +37,30 @@ targets:
     deploymentTarget: "15.0"
     sources:
       - path: AppHost
+        excludes:
+          - MVP6Main.m
     dependencies:
       - target: GuestPayload
         embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.livecontainertv.probe
+        PRODUCT_NAME: LiveContainerTV
+        INFOPLIST_FILE: AppHost/Info.plist
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+        TARGETED_DEVICE_FAMILY: "3"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        SUPPORTS_MACCATALYST: NO
+
+  LiveContainerTVMVP6:
+    type: application
+    platform: tvOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: AppHost/GuestRuntime.m
+      - path: AppHost/MVP6Main.m
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.livecontainertv.probe
