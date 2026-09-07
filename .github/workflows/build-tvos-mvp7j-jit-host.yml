@@ -1,0 +1,88 @@
+name: MVP7J JIT Host Template
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7HMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/MVP7JProbe.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/AppHost/Info.plist'
+      - 'tvOS/ProbeMVP0/project-mvp7j.yml'
+      - '.github/workflows/build-tvos-mvp7j-jit-host.yml'
+
+concurrency:
+  group: tvos-mvp7j-jit-host-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-host-template:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate standalone MVP7J project
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project-mvp7j.yml
+
+      - name: Build unsigned tvOS host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf build-mvp7j out-mvp7j
+          mkdir -p out-mvp7j
+          xcodebuild \
+            -project LiveContainerTVMVP7J.xcodeproj \
+            -scheme LiveContainerTVMVP7J \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7j \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out-mvp7j/xcodebuild.log
+
+      - name: Verify MVP7J host binary
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          APP='build-mvp7j/Build/Products/Release-appletvos/LiveContainerTV.app'
+          BIN="$APP/LiveContainerTV"
+          test -d "$APP"
+          test -f "$BIN"
+          file "$BIN"
+          lipo -info "$BIN" | tee out-mvp7j/lipo.txt
+          strings "$BIN" | grep -F 'MVP7J JIT' | head -n 5
+          strings "$BIN" | grep -F 'CS_DEBUGGED=YES' | head -n 5
+          strings "$BIN" | grep -F 'Run JIT memory probe' | head -n 5
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee out-mvp7j/bundle-id.txt
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" | tee out-mvp7j/executable.txt
+
+      - name: Package host template IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          APP='build-mvp7j/Build/Products/Release-appletvos/LiveContainerTV.app'
+          PKG='out-mvp7j/package/Payload'
+          rm -rf out-mvp7j/package
+          mkdir -p "$PKG"
+          cp -R "$APP" "$PKG/"
+          (cd out-mvp7j/package && zip -qry ../LiveContainerTV-MVP7J-JIT-HostTemplate.ipa Payload)
+          shasum -a 256 out-mvp7j/LiveContainerTV-MVP7J-JIT-HostTemplate.ipa | tee out-mvp7j/SHA256.txt
+
+      - name: Upload MVP7J host template
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainerTV-MVP7J-JIT-HostTemplate
+          path: |
+            tvOS/ProbeMVP0/out-mvp7j/LiveContainerTV-MVP7J-JIT-HostTemplate.ipa
+            tvOS/ProbeMVP0/out-mvp7j/SHA256.txt
+            tvOS/ProbeMVP0/out-mvp7j/xcodebuild.log
+          if-no-files-found: error
