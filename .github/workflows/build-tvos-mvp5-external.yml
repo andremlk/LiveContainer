@@ -128,6 +128,40 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build | tee out/mvp5-host-xcodebuild.log
 
+      - name: Build and embed patched MVP5P UIKit guest
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme UIKitGuestTV \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp5-uikit-guest \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp5-uikit-guest-xcodebuild.log
+
+          GUEST='build-mvp5-uikit-guest/Build/Products/Release-appletvos/UIKitGuestTV.app/UIKitGuestTV'
+          test -f "$GUEST"
+          cp "$GUEST" out/UIKitGuestTV.mvp5p.patched
+          ./build-tools/lctv_macho_patch out/UIKitGuestTV.mvp5p.patched
+          python3 Tools/verify_macho.py out/UIKitGuestTV.mvp5p.patched
+
+          HOST='build-mvp5-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          UIKIT="$HOST/Frameworks/UIKitGuestTV.framework"
+          rm -rf "$UIKIT"
+          mkdir -p "$UIKIT"
+          cp out/UIKitGuestTV.mvp5p.patched "$UIKIT/UIKitGuestTV"
+          cp UIKitGuestTV/FrameworkInfo.plist "$UIKIT/Info.plist"
+          chmod 755 "$UIKIT/UIKitGuestTV"
+
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$UIKIT/Info.plist")" = 'UIKitGuestTV'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$UIKIT/Info.plist")" = 'FMWK'
+          test -f "$UIKIT/UIKitGuestTV"
+          echo "MVP5P STAGING PASS: patched UIKitGuestTV embedded for host pre-main probe"
+
       - name: Stage external guest inside LiveContainerTV
         working-directory: tvOS/ProbeMVP0
         run: |
@@ -149,6 +183,8 @@ jobs:
         run: |
           set -euo pipefail
           HOST='build-mvp5-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          test -f "$HOST/Frameworks/UIKitGuestTV.framework/UIKitGuestTV"
+          test -f "$HOST/Frameworks/MVP5ExternalGuest.framework/Info.plist"
           rm -rf out/mvp5-host-ipa
           mkdir -p out/mvp5-host-ipa/Payload
           cp -R "$HOST" out/mvp5-host-ipa/Payload/
@@ -165,6 +201,8 @@ jobs:
             tvOS/ProbeMVP0/out/MVP5-External-dependencies.txt
             tvOS/ProbeMVP0/out/mvp5-external-prepared/**
             tvOS/ProbeMVP0/out/MVP5ExternalGuest.framework/**
+            tvOS/ProbeMVP0/out/UIKitGuestTV.mvp5p.patched
             tvOS/ProbeMVP0/out/LiveContainerTV-MVP5-External-Staged.ipa
             tvOS/ProbeMVP0/out/mvp5-external-xcodebuild.log
             tvOS/ProbeMVP0/out/mvp5-host-xcodebuild.log
+            tvOS/ProbeMVP0/out/mvp5-uikit-guest-xcodebuild.log
