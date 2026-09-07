@@ -1,0 +1,270 @@
+name: MVP7H Incremental Import Update
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7HMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/Tools/**'
+      - 'tvOS/ProbeMVP0/UIKitGuestTV/**'
+      - 'tvOS/ProbeMVP0/project.yml'
+      - '.github/workflows/build-tvos-mvp7h-incremental-update.yml'
+
+concurrency:
+  group: tvos-mvp7h-incremental-update-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  incremental-update:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build Mach-O patcher and generate project
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p build-tools out
+          xcrun clang -std=c11 -Wall -Wextra -Werror \
+            Tools/lctv_macho_patch.c \
+            -o build-tools/lctv_macho_patch
+          xcodegen generate
+
+      - name: Build pinned Sample Guide IPA
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/lctv-mvp7h-sample
+          git clone --quiet https://github.com/abdulkarimkhaan/tvOS-sample-guide.git /tmp/lctv-mvp7h-sample
+          cd /tmp/lctv-mvp7h-sample
+          git checkout --quiet e1a672c59e2d3045542e351d326aa7642c4fa895
+
+          OUT="$GITHUB_WORKSPACE/tvOS/ProbeMVP0/out"
+          xcodebuild \
+            -project tvOS-Sample-Guide.xcodeproj \
+            -scheme tvOS-Sample-Guide \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$OUT/mvp7h-sample-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee "$OUT/mvp7h-sample-xcodebuild.log"
+
+          PRODUCTS="$OUT/mvp7h-sample-derived/Build/Products/Release-appletvos"
+          APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          test -n "$APP"
+          rm -rf "$OUT/mvp7h-sample-ipa"
+          mkdir -p "$OUT/mvp7h-sample-ipa/Payload"
+          cp -R "$APP" "$OUT/mvp7h-sample-ipa/Payload/"
+          (cd "$OUT/mvp7h-sample-ipa" && zip -qry ../MVP7H-Sample-Guide.ipa Payload)
+          test -f "$OUT/MVP7H-Sample-Guide.ipa"
+
+      - name: Build new UIKitGuestTV IPA to add incrementally
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme UIKitGuestTV \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7h-uikit \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp7h-uikit-xcodebuild.log
+
+          APP='build-mvp7h-uikit/Build/Products/Release-appletvos/UIKitGuestTV.app'
+          test -d "$APP"
+          rm -rf out/mvp7h-uikit-ipa
+          mkdir -p out/mvp7h-uikit-ipa/Payload
+          cp -R "$APP" out/mvp7h-uikit-ipa/Payload/
+          (cd out/mvp7h-uikit-ipa && zip -qry ../MVP7H-UIKitGuestTV.ipa Payload)
+          test -f out/MVP7H-UIKitGuestTV.ipa
+
+      - name: Download pinned NuvioTV unsigned IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          NUVIO='out/NuvioTV-3.3.3-unsigned-release.ipa'
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$NUVIO" \
+            'https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa'
+          echo '80d6f9b4fbd29b20bdbea71e493a782c9bd1a38ca5541a11940666054118eee1  out/NuvioTV-3.3.3-unsigned-release.ipa' | shasum -a 256 -c -
+
+      - name: Recreate installed MVP7G registry baseline
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          REG='out/mvp7h-registry'
+          rm -rf "$REG"
+          export LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch"
+
+          python3 Tools/lctv_import_guest.py \
+            out/MVP7H-Sample-Guide.ipa "$REG" | tee out/MVP7H-Baseline-Sample.txt
+          python3 Tools/lctv_import_guest.py \
+            out/NuvioTV-3.3.3-unsigned-release.ipa "$REG" | tee out/MVP7H-Baseline-Nuvio.txt
+
+          cp "$REG/LCTVImportCatalog.json" out/MVP7H-BaselineCatalog.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          catalog = json.loads(Path('out/MVP7H-BaselineCatalog.json').read_text())
+          ids = {g['bundleID'] for g in catalog['guests']}
+          assert ids == {'com.pyksel.nuviotvos', 'com.abdul.tvOS-Sample-Guide'}, ids
+          print('MVP7H BASELINE PASS: 2 previously installed guests')
+          PY
+
+      - name: Incrementally import one new IPA into persistent registry
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          REG='out/mvp7h-registry'
+          export LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch"
+          python3 Tools/lctv_import_guest.py \
+            out/MVP7H-UIKitGuestTV.ipa "$REG" | tee out/MVP7H-Incremental-Import.txt
+
+      - name: Verify incremental registry preserves old guests
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee out/MVP7H-Registry-Verification.txt
+          import json, plistlib
+          from pathlib import Path
+
+          baseline = json.loads(Path('out/MVP7H-BaselineCatalog.json').read_text())
+          root = Path('out/mvp7h-registry')
+          current = json.loads((root / 'LCTVImportCatalog.json').read_text())
+          before = {g['bundleID']: g for g in baseline['guests']}
+          after = {g['bundleID']: g for g in current['guests']}
+
+          assert set(before) == {'com.pyksel.nuviotvos', 'com.abdul.tvOS-Sample-Guide'}
+          assert set(after) == {'com.pyksel.nuviotvos', 'com.abdul.tvOS-Sample-Guide', 'dev.livecontainertv.uikitguest'}, set(after)
+          for bundle_id in before:
+              assert after[bundle_id]['fingerprint'] == before[bundle_id]['fingerprint'], bundle_id
+              print('PRESERVED', bundle_id, after[bundle_id]['fingerprint'][:12])
+
+          added = after['dev.livecontainertv.uikitguest']
+          print('ADDED', added['bundleID'], added['fingerprint'][:12])
+
+          for guest in current['guests']:
+              slot = root / guest['codeSlot']
+              seed = root / guest['resourceSeed']
+              slot_info = plistlib.loads((slot / 'Info.plist').read_bytes())
+              seed_info = plistlib.loads((seed / 'Info.plist').read_bytes())
+              exe = guest['executable']
+              assert slot_info['LCTVImportFingerprint'] == guest['fingerprint']
+              assert seed_info['LCTVImportFingerprint'] == guest['fingerprint']
+              assert (slot / exe).is_file()
+              assert not (seed / exe).exists()
+              assert not (seed / 'Frameworks').exists()
+              assert not list(seed.glob('*.dylib'))
+
+          assert after['com.pyksel.nuviotvos']['nestedFrameworks'] == 36
+          assert after['com.abdul.tvOS-Sample-Guide']['nestedFrameworks'] == 0
+          assert after['dev.livecontainertv.uikitguest']['nestedFrameworks'] == 0
+          print('MVP7H INCREMENTAL REGISTRY PASS: 2 preserved + 1 added')
+          PY
+
+      - name: Build MVP7H host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme LiveContainerTVMVP7H \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7h-host \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp7h-host-xcodebuild.log
+
+      - name: Verify update host source contract
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          grep -q 'Library/Caches/LiveContainerTV/ImportLibrary' AppHost/MVP7HMain.m
+          grep -q 'Library/Caches/LiveContainerTV/Guests/%@/Data' AppHost/MVP7HMain.m
+          grep -q 'LCTVUpdateManifest' AppHost/MVP7HMain.m
+          grep -q 'Incremental IPA Update' AppHost/MVP7HMain.m
+          grep -q 'PRESERVED' AppHost/MVP7HMain.m
+          grep -q 'LCTVCodeSlot' AppHost/MVP7HMain.m
+          grep -q 'LCTVResourceSeed' AppHost/MVP7HMain.m
+          echo 'MVP7H HOST SOURCE PASS'
+
+      - name: Assemble outer-app update from persistent registry
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7h-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          python3 Tools/lctv_assemble_update.py \
+            "$HOST" \
+            out/mvp7h-registry \
+            --baseline-catalog out/MVP7H-BaselineCatalog.json | tee out/MVP7H-Update-Assembly.txt
+
+      - name: Verify assembled update delta and staged code
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee out/MVP7H-Staging.txt
+          import json, plistlib, subprocess
+          from pathlib import Path
+
+          host = Path('build-mvp7h-host/Build/Products/Release-appletvos/LiveContainerTV.app')
+          manifest = json.loads((host / 'LCTVUpdateManifest.json').read_text())
+          catalog = json.loads((host / 'LCTVImportCatalog.json').read_text())
+
+          assert manifest['counts'] == {'added': 1, 'preserved': 2, 'updated': 0, 'removed': 0}, manifest
+          assert manifest['added'] == ['dev.livecontainertv.uikitguest'], manifest
+          assert set(manifest['preserved']) == {'com.pyksel.nuviotvos', 'com.abdul.tvOS-Sample-Guide'}, manifest
+          assert manifest['guestDataPolicy'] == 'stable-by-bundle-id'
+          assert len(catalog['guests']) == 3
+
+          for guest in catalog['guests']:
+              slot = host / 'Frameworks' / Path(guest['codeSlot']).name
+              seed = host / 'GuestSeeds' / Path(guest['resourceSeed']).name
+              info = plistlib.loads((slot / 'Info.plist').read_bytes())
+              exe = info['CFBundleExecutable']
+              subprocess.run(['python3', 'Tools/verify_macho.py', str(slot / exe)], check=True)
+              assert seed.is_dir(), seed
+              assert not (seed / exe).exists()
+              assert not (seed / 'Frameworks').exists()
+              print(guest['bundleID'], 'frameworks=', guest['nestedFrameworks'], slot.name, seed.name)
+
+          print('MVP7H STAGING PASS: update keeps 2 guests and adds 1 new signed slot')
+          PY
+
+      - name: Package MVP7H incremental update IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7h-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out/mvp7h-host-ipa
+          mkdir -p out/mvp7h-host-ipa/Payload
+          cp -R "$HOST" out/mvp7h-host-ipa/Payload/
+          (cd out/mvp7h-host-ipa && zip -qry ../LiveContainerTV-MVP7H-IncrementalUpdate.ipa Payload)
+          test -f out/LiveContainerTV-MVP7H-IncrementalUpdate.ipa
+          shasum -a 256 out/LiveContainerTV-MVP7H-IncrementalUpdate.ipa | tee out/MVP7H-IPA-SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MVP7H-Incremental-Import-Update
+          path: |
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP7H-IncrementalUpdate.ipa
+            tvOS/ProbeMVP0/out/MVP7H-IPA-SHA256.txt
+            tvOS/ProbeMVP0/out/MVP7H-BaselineCatalog.json
+            tvOS/ProbeMVP0/out/MVP7H-Incremental-Import.txt
+            tvOS/ProbeMVP0/out/MVP7H-Registry-Verification.txt
+            tvOS/ProbeMVP0/out/MVP7H-Update-Assembly.txt
+            tvOS/ProbeMVP0/out/MVP7H-Staging.txt
+            tvOS/ProbeMVP0/out/mvp7h-registry/LCTVImportCatalog.json
+            tvOS/ProbeMVP0/out/mvp7h-registry/Manifests/*.json
+            tvOS/ProbeMVP0/out/mvp7h-host-xcodebuild.log

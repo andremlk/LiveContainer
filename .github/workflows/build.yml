@@ -13,6 +13,7 @@ on:
 jobs:
   build:
     name: Build using xcodebuild command
+    if: github.ref != 'refs/heads/tvos-mvp0' && github.head_ref != 'tvos-mvp0'
     runs-on: macos-latest
     env:
       scheme: LiveContainer

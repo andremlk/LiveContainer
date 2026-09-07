@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${LCTV_STATE_DIR:-$HOME/.local/share/livecontainertv}"
+CURRENT_IPA="$STATE_DIR/current.ipa"
+OUTPUT_DIR="${LCTV_OUTPUT_DIR:-/sdcard/Download}"
+
+usage() {
+  cat <<'EOF'
+Uso:
+  lctv-rebase <host-template.ipa> [salida.ipa]
+
+Reemplaza SOLO el ejecutable exterior de LiveContainerTV usando un host template
+nuevo, conservando los CodeSlots, GuestSeeds, catálogo y datos de la IPA actual.
+El resultado sigue sin firmar y debe instalarse con el mismo bundle ID exterior.
+EOF
+}
+
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || { usage; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: falta python3" >&2; exit 1; }
+command -v unzip >/dev/null 2>&1 || { echo "ERROR: falta unzip" >&2; exit 1; }
+command -v zip >/dev/null 2>&1 || { echo "ERROR: falta zip" >&2; exit 1; }
+
+TEMPLATE="$1"
+OUT="${2:-$OUTPUT_DIR/LiveContainerTV-MVP7J-Rebased.ipa}"
+
+[ -f "$CURRENT_IPA" ] || {
+  echo "ERROR: no existe $CURRENT_IPA; inicializa primero con lctv init <ipa>." >&2
+  exit 1
+}
+[ -f "$TEMPLATE" ] || { echo "ERROR: no existe host template: $TEMPLATE" >&2; exit 1; }
+
+CURRENT_IPA="$(python3 - "$CURRENT_IPA" <<'PY'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+TEMPLATE="$(python3 - "$TEMPLATE" <<'PY'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+OUT="$(python3 - "$OUT" <<'PY'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+mkdir -p "$(dirname "$OUT")"
+
+TMP_BASE="${TMPDIR:-}"
+if [ -z "$TMP_BASE" ] && [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/tmp" ]; then
+  TMP_BASE="$PREFIX/tmp"
+fi
+if [ -z "$TMP_BASE" ]; then
+  TMP_BASE="/tmp"
+fi
+WORK="$(mktemp -d "$TMP_BASE/lctv-rebase.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+unzip -q "$CURRENT_IPA" -d "$WORK/current"
+unzip -q "$TEMPLATE" -d "$WORK/template"
+
+python3 - "$WORK/current" "$WORK/template" "$WORK/before.json" <<'PY'
+import hashlib, json, plistlib, shutil, sys
+from pathlib import Path
+
+current_root, template_root, snapshot_path = map(Path, sys.argv[1:])
+
+def app(root: Path) -> Path:
+    apps = list((root / 'Payload').glob('*.app'))
+    if len(apps) != 1:
+        raise SystemExit(f'expected exactly one Payload/*.app in {root}, got {len(apps)}')
+    return apps[0]
+
+def info(app_path: Path):
+    return plistlib.loads((app_path / 'Info.plist').read_bytes())
+
+def code_slots(app_path: Path):
+    result = []
+    fwroot = app_path / 'Frameworks'
+    if fwroot.is_dir():
+        for fw in sorted(fwroot.glob('*.framework')):
+            p = fw / 'Info.plist'
+            if not p.is_file():
+                continue
+            try:
+                d = plistlib.loads(p.read_bytes())
+            except Exception:
+                continue
+            if d.get('LCTVCodeSlot'):
+                result.append(fw.name)
+    return result
+
+def guest_seeds(app_path: Path):
+    root = app_path / 'GuestSeeds'
+    return sorted(p.name for p in root.iterdir()) if root.is_dir() else []
+
+cur = app(current_root)
+tpl = app(template_root)
+cur_info = info(cur)
+tpl_info = info(tpl)
+cur_exec = cur_info.get('CFBundleExecutable')
+tpl_exec = tpl_info.get('CFBundleExecutable')
+if not cur_exec or not tpl_exec:
+    raise SystemExit('missing CFBundleExecutable')
+source = tpl / tpl_exec
+dest = cur / cur_exec
+if not source.is_file() or not dest.is_file():
+    raise SystemExit(f'host executable missing: template={source.is_file()} current={dest.is_file()}')
+raw = source.read_bytes()
+if b'MVP7J JIT' not in raw or b'Run JIT memory probe' not in raw:
+    raise SystemExit('template executable does not contain MVP7J JIT probe markers')
+
+catalog = cur / 'LCTVImportCatalog.json'
+catalog_sha = hashlib.sha256(catalog.read_bytes()).hexdigest() if catalog.is_file() else None
+snapshot = {
+    'currentApp': cur.name,
+    'currentExecutable': cur_exec,
+    'templateExecutable': tpl_exec,
+    'codeSlots': code_slots(cur),
+    'guestSeeds': guest_seeds(cur),
+    'catalogSHA256': catalog_sha,
+}
+snapshot_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True))
+
+shutil.copy2(source, dest)
+dest.chmod(dest.stat().st_mode | 0o111)
+print('MVP7J HOST EXECUTABLE SWAP PASS')
+print('  codeSlots=', len(snapshot['codeSlots']))
+print('  guestSeeds=', len(snapshot['guestSeeds']))
+print('  catalogSHA256=', catalog_sha)
+PY
+
+HOST="$(find "$WORK/current/Payload" -maxdepth 1 -type d -name '*.app' | head -n1)"
+find "$HOST" -type d -name '_CodeSignature' -prune -exec rm -rf {} + 2>/dev/null || true
+find "$HOST" -type f \( -name 'embedded.mobileprovision' -o -name 'embedded.provisionprofile' \) -delete 2>/dev/null || true
+
+rm -f "$OUT"
+(cd "$WORK/current" && zip -qry "$OUT" Payload)
+
+python3 - "$OUT" "$WORK/before.json" <<'PY'
+import hashlib, json, plistlib, sys, zipfile
+from pathlib import Path
+
+ipa = Path(sys.argv[1])
+before = json.loads(Path(sys.argv[2]).read_text())
+with zipfile.ZipFile(ipa) as z:
+    names = z.namelist()
+    apps = sorted({n.split('/', 2)[1] for n in names if n.startswith('Payload/') and len(n.split('/')) >= 3 and n.split('/', 2)[1].endswith('.app')})
+    if len(apps) != 1:
+        raise SystemExit(f'bad output app count: {apps}')
+    root = f'Payload/{apps[0]}/'
+    info = plistlib.loads(z.read(root + 'Info.plist'))
+    executable = info['CFBundleExecutable']
+    binary = z.read(root + executable)
+    if b'MVP7J JIT' not in binary:
+        raise SystemExit('rebased output lost MVP7J marker')
+
+    slots = []
+    for n in names:
+        if not n.startswith(root + 'Frameworks/') or not n.endswith('.framework/Info.plist'):
+            continue
+        try:
+            d = plistlib.loads(z.read(n))
+        except Exception:
+            continue
+        if d.get('LCTVCodeSlot'):
+            slots.append(Path(n).parent.name)
+    slots = sorted(set(slots))
+    seeds = sorted({n[len(root+'GuestSeeds/'):].split('/',1)[0] for n in names if n.startswith(root+'GuestSeeds/') and len(n) > len(root+'GuestSeeds/')})
+    catalog_name = root + 'LCTVImportCatalog.json'
+    catalog_sha = hashlib.sha256(z.read(catalog_name)).hexdigest() if catalog_name in names else None
+
+if slots != before['codeSlots']:
+    raise SystemExit(f'code slot preservation failed: before={before["codeSlots"]} after={slots}')
+if seeds != before['guestSeeds']:
+    raise SystemExit(f'guest seed preservation failed: before={before["guestSeeds"]} after={seeds}')
+if catalog_sha != before['catalogSHA256']:
+    raise SystemExit('catalog preservation failed')
+
+h = hashlib.sha256()
+with ipa.open('rb') as f:
+    for chunk in iter(lambda: f.read(1024*1024), b''):
+        h.update(chunk)
+print('MVP7J REBASE PACKAGE PASS')
+print('  preserved codeSlots=', len(slots))
+print('  preserved guestSeeds=', len(seeds))
+print('  sha256=', h.hexdigest())
+print('  output=', ipa)
+PY
+
+cp -f "$OUT" "$CURRENT_IPA"
+echo "MVP7J CURRENT IPA UPDATED: $CURRENT_IPA"
+echo "$OUT"

@@ -1,0 +1,179 @@
+name: MVP7F Minimal Signed Slot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7FMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/Tools/**'
+      - 'tvOS/ProbeMVP0/project.yml'
+      - '.github/workflows/build-tvos-mvp7f-minimal-slot.yml'
+
+concurrency:
+  group: tvos-mvp7f-minimal-slot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  minimal-slot:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build LiveContainerTV Mach-O patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p build-tools out
+          xcrun clang -std=c11 -Wall -Wextra -Werror \
+            Tools/lctv_macho_patch.c \
+            -o build-tools/lctv_macho_patch
+
+      - name: Download pinned NuvioTV unsigned IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          NUVIO='out/NuvioTV-3.3.3-unsigned-release.ipa'
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$NUVIO" \
+            'https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa'
+          echo '80d6f9b4fbd29b20bdbea71e493a782c9bd1a38ca5541a11940666054118eee1  out/NuvioTV-3.3.3-unsigned-release.ipa' | shasum -a 256 -c -
+
+      - name: Analyze Nuvio guest
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_ipa_analyze.py \
+            out/NuvioTV-3.3.3-unsigned-release.ipa \
+            --json-out out/MVP7F-Nuvio-analysis.json | tee out/MVP7F-Nuvio-analysis.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('out/MVP7F-Nuvio-analysis.json').read_text())
+          assert report['compatible_for_mvp5'] is True, report
+          assert report['macho']['arm64'] is True, report
+          assert report['macho']['filetype_name'] == 'MH_EXECUTE', report
+          assert report['macho']['lc_main'], report
+          assert not report['macho']['encrypted'], report
+          assert len(report.get('embedded', {}).get('frameworks', [])) >= 1, report
+          print('MVP7F ANALYZE PASS:', report['app']['display_name'], report['app']['bundle_id'])
+          PY
+
+      - name: Prepare patched Nuvio app
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          chmod +x Tools/lctv_prepare_ipa.sh
+          LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
+            bash Tools/lctv_prepare_ipa.sh \
+              out/NuvioTV-3.3.3-unsigned-release.ipa \
+              out/mvp7f-nuvio-prepared
+
+      - name: Split Nuvio into minimal signed code and resource-only seed
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_split_guest.py \
+            out/mvp7f-nuvio-prepared \
+            out/NuvioCodeSlot.framework \
+            out/NuvioResources.lctvseed | tee out/MVP7F-Split.txt
+
+          python3 - <<'PY'
+          import json, plistlib
+          from pathlib import Path
+          slot = Path('out/NuvioCodeSlot.framework')
+          info = plistlib.loads((slot / 'Info.plist').read_bytes())
+          exe = info['CFBundleExecutable']
+          assert info.get('LCTVCodeSlot') is True, info
+          assert info.get('LCTVGuestBundleIdentifier') == 'com.pyksel.nuviotvos', info
+          assert (slot / exe).is_file(), exe
+          frameworks = list((slot / 'Frameworks').glob('*.framework'))
+          assert len(frameworks) == 36, len(frameworks)
+          seed = Path('out/NuvioResources.lctvseed')
+          assert (seed / 'Info.plist').is_file()
+          assert not (seed / exe).exists()
+          assert not (seed / 'Frameworks').exists()
+          seed_info = plistlib.loads((seed / 'Info.plist').read_bytes())
+          assert seed_info.get('LCTVResourceSeed') is True
+          manifest = json.loads((slot / 'LCTVCodeSlotManifest.json').read_text())
+          assert manifest['resourceSeedHasExecutable'] is False
+          assert manifest['resourceSeedHasFrameworks'] is False
+          print('MVP7F MINIMAL SPLIT PASS: signedFrameworks=', len(frameworks))
+          print('originalBytes=', manifest['originalBytes'])
+          print('codeSlotBytes=', manifest['codeSlotBytes'])
+          print('resourceSeedBytes=', manifest['resourceSeedBytes'])
+          PY
+
+      - name: Build MVP7F host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme LiveContainerTVMVP7F \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7f-host \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp7f-host-xcodebuild.log
+
+      - name: Verify minimal-slot source contract
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          grep -q 'Library/Caches/LiveContainerTV/MinimalSplit' AppHost/MVP7FMain.m
+          grep -q 'LCTVCodeSlot' AppHost/MVP7FMain.m
+          grep -q 'LCTVResourceSeed' AppHost/MVP7FMain.m
+          grep -q 'writable resource bundle contains code' AppHost/MVP7FMain.m
+          grep -q 'dlopen(\[slot\[@"executablePath"\] fileSystemRepresentation\]' AppHost/MVP7FMain.m
+          echo 'MVP7F SOURCE CONTRACT PASS'
+
+      - name: Stage minimal signed code slot and resource seed
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7f-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          test -d "$HOST"
+          mkdir -p "$HOST/Frameworks" "$HOST/GuestSeeds"
+          cp -R out/NuvioCodeSlot.framework "$HOST/Frameworks/NuvioCodeSlot.framework"
+          cp -R out/NuvioResources.lctvseed "$HOST/GuestSeeds/NuvioResources.lctvseed"
+
+          INFO="$HOST/Frameworks/NuvioCodeSlot.framework/Info.plist"
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO")"
+          python3 Tools/verify_macho.py "$HOST/Frameworks/NuvioCodeSlot.framework/$EXEC"
+
+          test ! -e "$HOST/GuestSeeds/NuvioResources.lctvseed/$EXEC"
+          test ! -d "$HOST/GuestSeeds/NuvioResources.lctvseed/Frameworks"
+          test -d "$HOST/Frameworks/NuvioCodeSlot.framework/Frameworks"
+          echo 'MVP7F STAGING PASS' | tee out/MVP7F-Staging.txt
+
+      - name: Package MVP7F minimal-slot IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7f-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out/mvp7f-host-ipa
+          mkdir -p out/mvp7f-host-ipa/Payload
+          cp -R "$HOST" out/mvp7f-host-ipa/Payload/
+          (cd out/mvp7f-host-ipa && zip -qry ../LiveContainerTV-MVP7F-MinimalSlot.ipa Payload)
+          test -f out/LiveContainerTV-MVP7F-MinimalSlot.ipa
+          shasum -a 256 out/LiveContainerTV-MVP7F-MinimalSlot.ipa | tee out/MVP7F-IPA-SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MVP7F-Minimal-Signed-Slot
+          path: |
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP7F-MinimalSlot.ipa
+            tvOS/ProbeMVP0/out/MVP7F-IPA-SHA256.txt
+            tvOS/ProbeMVP0/out/MVP7F-Nuvio-analysis.json
+            tvOS/ProbeMVP0/out/MVP7F-Split.txt
+            tvOS/ProbeMVP0/out/MVP7F-Staging.txt
+            tvOS/ProbeMVP0/out/mvp7f-host-xcodebuild.log

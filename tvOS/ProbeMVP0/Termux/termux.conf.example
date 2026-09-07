@@ -1,0 +1,17 @@
+# LiveContainerTV MVP7I Termux companion
+# Copy to: ~/.config/livecontainertv/termux.conf
+#
+# IMPORTANT: LCTV_CUSTOM_IDENTIFIER must be exactly the same outer bundle ID
+# that you already use to sign/install LiveContainerTV. Changing it installs a
+# separate container and therefore does not preserve the existing app sandbox.
+
+LCTV_ATV_IP='192.168.x.x'
+LCTV_CUSTOM_IDENTIFIER='your.existing.livecontainertv.bundle.id'
+LCTV_CUSTOM_NAME='LiveContainerTV'
+LCTV_PROOT_DISTRO='atvloadly'
+
+# Normally these can be auto-detected when exactly one pairing file exists in
+# /data/PlumeImpactor/pairing_files inside the atvloadly proot. Set them only if
+# you have multiple paired devices/files.
+# LCTV_UDID='...'
+# LCTV_PAIRING_FILE='/data/PlumeImpactor/pairing_files/<UDID>.plist'

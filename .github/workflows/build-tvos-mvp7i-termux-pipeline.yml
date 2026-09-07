@@ -1,0 +1,253 @@
+name: MVP7I Termux Import + Install Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/Termux/**'
+      - 'tvOS/ProbeMVP0/Tools/lctv_macho_patch.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_registry_from_host.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_prepare_ipa.sh'
+      - 'tvOS/ProbeMVP0/Tools/lctv_import_guest.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_split_guest.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_assemble_update.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_ipa_analyze.py'
+      - 'tvOS/ProbeMVP0/Tools/verify_macho.py'
+      - '.github/workflows/build-tvos-mvp7i-termux-pipeline.yml'
+
+concurrency:
+  group: tvos-mvp7i-termux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patcher-parity:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download pinned NuvioTV unsigned IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p out/mvp7i-parity
+          curl -fL --retry 3 --retry-delay 2 \
+            -o out/mvp7i-parity/Nuvio.ipa \
+            'https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa'
+          echo '80d6f9b4fbd29b20bdbea71e493a782c9bd1a38ca5541a11940666054118eee1  out/mvp7i-parity/Nuvio.ipa' | shasum -a 256 -c -
+
+      - name: Extract main executable
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import plistlib, zipfile
+          from pathlib import Path
+          ipa=Path('out/mvp7i-parity/Nuvio.ipa')
+          with zipfile.ZipFile(ipa) as z:
+              apps=sorted({n.split('/',2)[1] for n in z.namelist() if n.startswith('Payload/') and len(n.split('/'))>=3 and n.split('/',2)[1].endswith('.app')})
+              assert len(apps)==1, apps
+              root=f'Payload/{apps[0]}/'
+              info=plistlib.loads(z.read(root+'Info.plist'))
+              exe=info['CFBundleExecutable']
+              blob=z.read(root+exe)
+          Path('out/mvp7i-parity/c.bin').write_bytes(blob)
+          Path('out/mvp7i-parity/python.bin').write_bytes(blob)
+          print(exe, len(blob))
+          PY
+
+      - name: Build C patcher and compare byte-for-byte with Python patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcrun clang -std=c11 -Wall -Wextra -Werror Tools/lctv_macho_patch.c -o out/mvp7i-parity/lctv_macho_patch_c
+          out/mvp7i-parity/lctv_macho_patch_c out/mvp7i-parity/c.bin
+          python3 Tools/lctv_macho_patch.py out/mvp7i-parity/python.bin
+          cmp out/mvp7i-parity/c.bin out/mvp7i-parity/python.bin
+          python3 Tools/verify_macho.py out/mvp7i-parity/python.bin
+          shasum -a 256 out/mvp7i-parity/c.bin out/mvp7i-parity/python.bin | tee out/mvp7i-parity/parity-sha256.txt
+          echo 'MVP7I PATCHER PARITY PASS: Python output is byte-identical to C patcher'
+
+  portable-termux-pipeline:
+    needs: patcher-parity
+    runs-on: ubuntu-24.04
+    env:
+      PREFIX: /tmp
+      TMPDIR: /tmp
+      LCTV_OUTPUT_DIR: /tmp/lctv-output
+      LCTV_STATE_DIR: /tmp/lctv-state
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install portable dependencies
+        run: |
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y --no-install-recommends zip unzip dnsutils >/dev/null
+
+      - name: Shell syntax check
+        working-directory: tvOS/ProbeMVP0
+        run: bash -n Termux/lctv
+
+      - name: Download pinned NuvioTV unsigned IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p out/mvp7i-linux
+          curl -fL --retry 3 --retry-delay 2 \
+            -o out/mvp7i-linux/Nuvio.ipa \
+            'https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa'
+          echo '80d6f9b4fbd29b20bdbea71e493a782c9bd1a38ca5541a11940666054118eee1  out/mvp7i-linux/Nuvio.ipa' | sha256sum -c -
+
+      - name: Prove analyzer + prepare + import run without Xcode or Apple headers
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_ipa_analyze.py out/mvp7i-linux/Nuvio.ipa --json-out out/mvp7i-linux/analysis.json
+          python3 Tools/lctv_import_guest.py \
+            out/mvp7i-linux/Nuvio.ipa \
+            out/mvp7i-linux/direct-registry \
+            --patcher Tools/lctv_macho_patch.py | tee out/mvp7i-linux/direct-import.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('out/mvp7i-linux/direct-registry')
+          cat=json.loads((root/'LCTVImportCatalog.json').read_text())
+          assert len(cat['guests']) == 1, cat
+          g=cat['guests'][0]
+          assert g['bundleID']=='com.pyksel.nuviotvos', g
+          assert g['nestedFrameworks']==36, g
+          slot=root/g['codeSlot']; seed=root/g['resourceSeed']
+          assert (slot/g['executable']).is_file()
+          assert not (seed/g['executable']).exists()
+          assert not (seed/'Frameworks').exists()
+          print('MVP7I LINUX IMPORT PASS', g['bundleID'], g['nestedFrameworks'])
+          PY
+
+      - name: Create synthetic existing LiveContainerTV base IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf out/mvp7i-linux/base-root
+          mkdir -p out/mvp7i-linux/base-root/Payload/LiveContainerTV.app/Frameworks
+          mkdir -p out/mvp7i-linux/base-root/Payload/LiveContainerTV.app/GuestSeeds
+          python3 - <<'PY'
+          import json, plistlib
+          from pathlib import Path
+          app=Path('out/mvp7i-linux/base-root/Payload/LiveContainerTV.app')
+          info={
+              'CFBundleIdentifier':'dev.livecontainertv.probe',
+              'CFBundleName':'LiveContainerTV',
+              'CFBundleDisplayName':'LiveContainerTV',
+              'CFBundleExecutable':'LiveContainerTV',
+              'CFBundlePackageType':'APPL',
+              'CFBundleShortVersionString':'7.8',
+              'CFBundleVersion':'1',
+          }
+          (app/'Info.plist').write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_XML, sort_keys=True))
+          (app/'LiveContainerTV').write_bytes(b'host-fixture-not-executed')
+          (app/'LCTVImportCatalog.json').write_text(json.dumps({'format':1,'guests':[]}, indent=2, sort_keys=True)+'\n')
+          PY
+          (cd out/mvp7i-linux/base-root && zip -qry ../LiveContainerTV-Base.ipa Payload)
+
+      - name: Initialize Termux state and add Nuvio through exact companion command
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p "$LCTV_OUTPUT_DIR" "$LCTV_STATE_DIR"
+          bash Termux/lctv init out/mvp7i-linux/LiveContainerTV-Base.ipa | tee out/mvp7i-linux/termux-init.log
+          bash Termux/lctv add out/mvp7i-linux/Nuvio.ipa out/mvp7i-linux/LiveContainerTV-Termux-Nuvio.ipa | tee out/mvp7i-linux/termux-add.log
+
+      - name: Verify generated container update
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee out/mvp7i-linux/container-verification.txt
+          import json, zipfile
+          from pathlib import Path
+          ipa=Path('out/mvp7i-linux/LiveContainerTV-Termux-Nuvio.ipa')
+          with zipfile.ZipFile(ipa) as z:
+              root='Payload/LiveContainerTV.app/'
+              catalog=json.loads(z.read(root+'LCTVImportCatalog.json'))
+              update=json.loads(z.read(root+'LCTVUpdateManifest.json'))
+              assert len(catalog['guests'])==1, catalog
+              g=catalog['guests'][0]
+              assert g['bundleID']=='com.pyksel.nuviotvos', g
+              assert update['added']==['com.pyksel.nuviotvos'], update
+              assert update['preserved']==[], update
+              slot=root+'Frameworks/'+Path(g['codeSlot']).name+'/'
+              seed=root+'GuestSeeds/'+Path(g['resourceSeed']).name+'/'
+              names=set(z.namelist())
+              assert slot+g['executable'] in names
+              assert seed+g['executable'] not in names
+              assert not any(n.startswith(seed+'Frameworks/') for n in names)
+              print('bundleID=', g['bundleID'])
+              print('frameworks(metadata)=', g['nestedFrameworks'])
+              print('update=', update['counts'])
+          print('MVP7I TERMUX PACKAGE PASS')
+          PY
+
+      - name: Re-import same IPA and verify idempotent preservation
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          bash Termux/lctv add out/mvp7i-linux/Nuvio.ipa out/mvp7i-linux/LiveContainerTV-Termux-Nuvio-Again.ipa >/tmp/reimport.log
+          python3 - <<'PY'
+          import json, zipfile
+          with zipfile.ZipFile('out/mvp7i-linux/LiveContainerTV-Termux-Nuvio-Again.ipa') as z:
+              update=json.loads(z.read('Payload/LiveContainerTV.app/LCTVUpdateManifest.json'))
+          assert update['added']==[], update
+          assert update['updated']==[], update
+          assert update['removed']==[], update
+          assert update['preserved']==['com.pyksel.nuviotvos'], update
+          print('MVP7I IDEMPOTENT UPDATE PASS')
+          PY
+
+      - name: Package Termux toolkit
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          KIT='out/mvp7i-toolkit/LiveContainerTV-Termux'
+          rm -rf out/mvp7i-toolkit
+          mkdir -p "$KIT/bin" "$KIT/Tools"
+          cp Termux/lctv "$KIT/bin/lctv"
+          cp Termux/termux.conf.example "$KIT/termux.conf.example"
+          cp Tools/lctv_macho_patch.py "$KIT/Tools/"
+          cp Tools/lctv_registry_from_host.py "$KIT/Tools/"
+          cp Tools/lctv_ipa_analyze.py "$KIT/Tools/"
+          cp Tools/lctv_prepare_ipa.sh "$KIT/Tools/"
+          cp Tools/lctv_split_guest.py "$KIT/Tools/"
+          cp Tools/lctv_import_guest.py "$KIT/Tools/"
+          cp Tools/lctv_assemble_update.py "$KIT/Tools/"
+          cp Tools/verify_macho.py "$KIT/Tools/"
+          chmod +x "$KIT/bin/lctv"
+          cat > "$KIT/README.txt" <<'EOF'
+          LiveContainerTV MVP7I Termux toolkit
+
+          Dependencies:
+            pkg install python zip unzip dnsutils proot-distro
+
+          First use:
+            bin/lctv doctor
+            bin/lctv init /sdcard/Download/<current-LiveContainerTV.ipa>
+
+          Then an import can be built with:
+            bin/lctv add /sdcard/Download/<guest.ipa>
+
+          Signing/install uses the existing atvloadly proot + plumesign setup.
+          Copy termux.conf.example to ~/.config/livecontainertv/termux.conf and
+          set the Apple TV IP plus the SAME outer LiveContainerTV bundle ID
+          already used on the device before running `bin/lctv install` or
+          `bin/lctv add-install`.
+          EOF
+          (cd out/mvp7i-toolkit && zip -qry ../MVP7I-Termux-Toolkit.zip LiveContainerTV-Termux)
+          sha256sum out/MVP7I-Termux-Toolkit.zip | tee out/MVP7I-Termux-Toolkit-SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MVP7I-Termux-Import-Install-Toolkit
+          path: |
+            tvOS/ProbeMVP0/out/MVP7I-Termux-Toolkit.zip
+            tvOS/ProbeMVP0/out/MVP7I-Termux-Toolkit-SHA256.txt
+            tvOS/ProbeMVP0/out/mvp7i-linux/container-verification.txt
+            tvOS/ProbeMVP0/out/mvp7i-linux/termux-init.log
+            tvOS/ProbeMVP0/out/mvp7i-linux/termux-add.log

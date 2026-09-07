@@ -1,0 +1,185 @@
+name: MVP7D Nuvio Split Store
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7DMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/Tools/**'
+      - 'tvOS/ProbeMVP0/project.yml'
+      - '.github/workflows/build-tvos-mvp7d-split-store.yml'
+
+concurrency:
+  group: tvos-mvp7d-split-store-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  split-store:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build LiveContainerTV Mach-O patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p build-tools out
+          xcrun clang -std=c11 -Wall -Wextra -Werror \
+            Tools/lctv_macho_patch.c \
+            -o build-tools/lctv_macho_patch
+
+      - name: Download pinned NuvioTV unsigned IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          NUVIO='out/NuvioTV-3.3.3-unsigned-release.ipa'
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$NUVIO" \
+            'https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa'
+          echo '80d6f9b4fbd29b20bdbea71e493a782c9bd1a38ca5541a11940666054118eee1  out/NuvioTV-3.3.3-unsigned-release.ipa' | shasum -a 256 -c -
+
+          mkdir -p out/nuvio-license
+          curl -fL -o out/nuvio-license/LICENSE.txt \
+            'https://raw.githubusercontent.com/bobsupra/NuvioTVOS/tvos-beta-3.3.3/LICENSE'
+          printf '%s\n' \
+            'NuvioTVOS source: https://github.com/bobsupra/NuvioTVOS/tree/tvos-beta-3.3.3' \
+            'Binary source: upstream unsigned release tvos-beta-3.3.3' \
+            > out/nuvio-license/SOURCE.txt
+
+      - name: Analyze Nuvio guest
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_ipa_analyze.py \
+            out/NuvioTV-3.3.3-unsigned-release.ipa \
+            --json-out out/MVP7D-Nuvio-analysis.json | tee out/MVP7D-Nuvio-analysis.txt
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('out/MVP7D-Nuvio-analysis.json').read_text())
+          assert report['compatible_for_mvp5'] is True, report
+          assert report['macho']['arm64'] is True, report
+          assert report['macho']['filetype_name'] == 'MH_EXECUTE', report
+          assert report['macho']['lc_main'], report
+          assert not report['macho']['encrypted'], report
+          print('MVP7D ANALYZE PASS:', report['app']['display_name'], report['app']['bundle_id'])
+          PY
+
+      - name: Prepare Nuvio signed guest seed
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          chmod +x Tools/lctv_prepare_ipa.sh
+          LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
+            bash Tools/lctv_prepare_ipa.sh \
+              out/NuvioTV-3.3.3-unsigned-release.ipa \
+              out/mvp7d-nuvio-prepared
+
+          python3 Tools/lctv_wrap_guest_framework.py \
+            out/mvp7d-nuvio-prepared \
+            out/NuvioSignedGuest.framework
+
+          mkdir -p out/NuvioSignedGuest.framework/Licenses/NuvioTVOS
+          cp out/nuvio-license/LICENSE.txt out/NuvioSignedGuest.framework/Licenses/NuvioTVOS/
+          cp out/nuvio-license/SOURCE.txt out/NuvioSignedGuest.framework/Licenses/NuvioTVOS/
+          test ! -d out/NuvioSignedGuest.framework/PlugIns
+
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          fw = Path('out/NuvioSignedGuest.framework')
+          info = plistlib.loads((fw / 'Info.plist').read_bytes())
+          assert info.get('LCTVPreparedGuest') is True, info
+          assert info.get('CFBundleIdentifier') == 'com.pyksel.nuviotvos', info
+          exe = info['CFBundleExecutable']
+          assert (fw / exe).is_file(), exe
+          nested = list((fw / 'Frameworks').glob('*.framework'))
+          assert len(nested) >= 1, len(nested)
+          print(f'MVP7D NUVIO SEED PASS: nested frameworks={len(nested)} executable={exe}')
+          PY
+
+      - name: Build MVP7D host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme LiveContainerTVMVP7D \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7d-host \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp7d-host-xcodebuild.log
+
+      - name: Verify split-store source contract
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          grep -q 'Library/Caches/LiveContainerTV/SplitStore' AppHost/MVP7DMain.m
+          grep -q 'Always signed app-bundle code' AppHost/MVP7DMain.m
+          grep -q 'WRITABLE BUNDLE + SIGNED CODE' AppHost/MVP7DMain.m
+          grep -q 'LCTVPrepareHostGuestIdentityBeforeLoad(bundlePath' AppHost/MVP7DMain.m
+          grep -q 'dlopen(guestPath.fileSystemRepresentation' AppHost/MVP7DMain.m
+          echo 'MVP7D SPLIT-STORE SOURCE PASS'
+
+      - name: Stage signed Nuvio code inside host bundle
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7d-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          test -d "$HOST"
+          mkdir -p "$HOST/Frameworks"
+          cp -R out/NuvioSignedGuest.framework "$HOST/Frameworks/NuvioSignedGuest.framework"
+
+          INFO="$HOST/Frameworks/NuvioSignedGuest.framework/Info.plist"
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO")"
+          python3 Tools/verify_macho.py "$HOST/Frameworks/NuvioSignedGuest.framework/$EXEC"
+
+          python3 - <<'PY' | tee out/MVP7D-Staging.txt
+          import plistlib
+          from pathlib import Path
+          fw = Path('build-mvp7d-host/Build/Products/Release-appletvos/LiveContainerTV.app/Frameworks/NuvioSignedGuest.framework')
+          info = plistlib.loads((fw / 'Info.plist').read_bytes())
+          nested = list((fw / 'Frameworks').glob('*.framework'))
+          assert info.get('LCTVPreparedGuest') is True
+          assert info.get('CFBundleIdentifier') == 'com.pyksel.nuviotvos'
+          assert len(nested) >= 1
+          print('bundleID=', info.get('CFBundleIdentifier'))
+          print('version=', info.get('CFBundleShortVersionString'))
+          print('build=', info.get('CFBundleVersion'))
+          print('nestedFrameworks=', len(nested))
+          print('MVP7D STAGING PASS')
+          PY
+
+      - name: Package MVP7D split-store IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7d-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out/mvp7d-host-ipa
+          mkdir -p out/mvp7d-host-ipa/Payload
+          cp -R "$HOST" out/mvp7d-host-ipa/Payload/
+          (cd out/mvp7d-host-ipa && zip -qry ../LiveContainerTV-MVP7D-Nuvio-SplitStore.ipa Payload)
+          test -f out/LiveContainerTV-MVP7D-Nuvio-SplitStore.ipa
+          shasum -a 256 out/LiveContainerTV-MVP7D-Nuvio-SplitStore.ipa | tee out/MVP7D-IPA-SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MVP7D-Nuvio-Split-Store
+          path: |
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP7D-Nuvio-SplitStore.ipa
+            tvOS/ProbeMVP0/out/MVP7D-IPA-SHA256.txt
+            tvOS/ProbeMVP0/out/MVP7D-Nuvio-analysis.json
+            tvOS/ProbeMVP0/out/MVP7D-Staging.txt
+            tvOS/ProbeMVP0/out/mvp7d-host-xcodebuild.log
+            tvOS/ProbeMVP0/out/nuvio-license/**
