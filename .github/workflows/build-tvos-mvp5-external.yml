@@ -1,0 +1,121 @@
+name: MVP5 External tvOS Candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/Tools/**'
+      - '.github/workflows/build-tvos-mvp5-external.yml'
+  pull_request:
+    paths:
+      - 'tvOS/ProbeMVP0/Tools/**'
+      - '.github/workflows/build-tvos-mvp5-external.yml'
+
+jobs:
+  external-candidate:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build LiveContainerTV Mach-O patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          mkdir -p build-tools
+          xcrun clang -std=c11 -Wall -Wextra -Werror \
+            Tools/lctv_macho_patch.c \
+            -o build-tools/lctv_macho_patch
+
+      - name: Fetch pinned external MIT tvOS sample
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/lctv-external-tvos
+          git clone --quiet https://github.com/abdulkarimkhaan/tvOS-sample-guide.git /tmp/lctv-external-tvos
+          cd /tmp/lctv-external-tvos
+          git checkout --quiet e1a672c59e2d3045542e351d326aa7642c4fa895
+          test -f LICENSE
+          grep -qi 'MIT License' LICENSE
+          echo "External candidate commit: $(git rev-parse HEAD)"
+
+      - name: Build external tvOS app unsigned
+        run: |
+          set -euo pipefail
+          cd /tmp/lctv-external-tvos
+          xcodebuild \
+            -project tvOS-Sample-Guide.xcodeproj \
+            -scheme tvOS-Sample-Guide \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/tvOS/ProbeMVP0/out/mvp5-external-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee "$GITHUB_WORKSPACE/tvOS/ProbeMVP0/out/mvp5-external-xcodebuild.log"
+
+      - name: Package external app as IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          PRODUCTS='out/mvp5-external-derived/Build/Products/Release-appletvos'
+          APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          test -n "$APP"
+          echo "External app: $APP"
+          rm -rf out/mvp5-external-ipa
+          mkdir -p out/mvp5-external-ipa/Payload
+          cp -R "$APP" out/mvp5-external-ipa/Payload/
+          (cd out/mvp5-external-ipa && zip -qry ../MVP5-External-tvOS-Sample-Guide.ipa Payload)
+          test -f out/MVP5-External-tvOS-Sample-Guide.ipa
+
+      - name: MVP5A analyze real external IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_ipa_analyze.py \
+            out/MVP5-External-tvOS-Sample-Guide.ipa \
+            --json-out out/MVP5-External-analysis.json | tee out/MVP5-External-analysis.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r = json.loads(Path('out/MVP5-External-analysis.json').read_text())
+          assert r['compatible_for_mvp5'] is True, r
+          assert r['macho']['arm64'] is True
+          assert r['macho']['filetype_name'] == 'MH_EXECUTE'
+          assert r['macho']['lc_main']
+          assert not r['macho']['encrypted']
+          print('MVP5A EXTERNAL PASS:', r['app']['display_name'], r['app']['bundle_id'])
+          PY
+
+      - name: MVP5B prepare and wrap external IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          chmod +x Tools/lctv_prepare_ipa.sh
+          LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
+            bash Tools/lctv_prepare_ipa.sh \
+              out/MVP5-External-tvOS-Sample-Guide.ipa \
+              out/mvp5-external-prepared
+
+          python3 Tools/lctv_wrap_guest_framework.py \
+            out/mvp5-external-prepared \
+            out/MVP5ExternalGuest.framework
+
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' out/MVP5ExternalGuest.framework/Info.plist)"
+          TYPE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' out/MVP5ExternalGuest.framework/Info.plist)"
+          test "$TYPE" = 'FMWK'
+          test -f "out/MVP5ExternalGuest.framework/$EXEC"
+          python3 Tools/verify_macho.py "out/MVP5ExternalGuest.framework/$EXEC"
+          otool -hv "out/MVP5ExternalGuest.framework/$EXEC"
+          otool -L "out/MVP5ExternalGuest.framework/$EXEC" | tee out/MVP5-External-dependencies.txt
+          echo "MVP5B EXTERNAL PASS: external app is patched and signer-discoverable as framework guest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MVP5-External-Candidate
+          path: |
+            tvOS/ProbeMVP0/out/MVP5-External-tvOS-Sample-Guide.ipa
+            tvOS/ProbeMVP0/out/MVP5-External-analysis.json
+            tvOS/ProbeMVP0/out/MVP5-External-analysis.txt
+            tvOS/ProbeMVP0/out/MVP5-External-dependencies.txt
+            tvOS/ProbeMVP0/out/mvp5-external-prepared/**
+            tvOS/ProbeMVP0/out/MVP5ExternalGuest.framework/**
+            tvOS/ProbeMVP0/out/mvp5-external-xcodebuild.log
