@@ -1,4 +1,4 @@
-name: MVP7 Dynamic tvOS Guest Library
+name: MVP7B Writable tvOS Guest Store
 
 on:
   workflow_dispatch:
@@ -13,11 +13,11 @@ on:
       - '.github/workflows/build-tvos-mvp7-library.yml'
 
 concurrency:
-  group: tvos-mvp7-library-${{ github.ref }}
+  group: tvos-mvp7b-writable-store-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  dynamic-library:
+  writable-store:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -37,9 +37,9 @@ jobs:
       - name: Build known-good Sample Guide IPA
         run: |
           set -euo pipefail
-          rm -rf /tmp/lctv-mvp7-sample
-          git clone --quiet https://github.com/abdulkarimkhaan/tvOS-sample-guide.git /tmp/lctv-mvp7-sample
-          cd /tmp/lctv-mvp7-sample
+          rm -rf /tmp/lctv-mvp7b-sample
+          git clone --quiet https://github.com/abdulkarimkhaan/tvOS-sample-guide.git /tmp/lctv-mvp7b-sample
+          cd /tmp/lctv-mvp7b-sample
           git checkout --quiet e1a672c59e2d3045542e351d326aa7642c4fa895
 
           OUT="$GITHUB_WORKSPACE/tvOS/ProbeMVP0/out"
@@ -49,19 +49,19 @@ jobs:
             -configuration Release \
             -sdk appletvos \
             -destination 'generic/platform=tvOS' \
-            -derivedDataPath "$OUT/mvp7-sample-derived" \
+            -derivedDataPath "$OUT/mvp7b-sample-derived" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            build | tee "$OUT/mvp7-sample-xcodebuild.log"
+            build | tee "$OUT/mvp7b-sample-xcodebuild.log"
 
-          PRODUCTS="$OUT/mvp7-sample-derived/Build/Products/Release-appletvos"
+          PRODUCTS="$OUT/mvp7b-sample-derived/Build/Products/Release-appletvos"
           APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' | head -n 1)"
           test -n "$APP"
-          rm -rf "$OUT/mvp7-sample-ipa"
-          mkdir -p "$OUT/mvp7-sample-ipa/Payload"
-          cp -R "$APP" "$OUT/mvp7-sample-ipa/Payload/"
-          (cd "$OUT/mvp7-sample-ipa" && zip -qry ../MVP7-Sample-Guide.ipa Payload)
-          test -f "$OUT/MVP7-Sample-Guide.ipa"
+          rm -rf "$OUT/mvp7b-sample-ipa"
+          mkdir -p "$OUT/mvp7b-sample-ipa/Payload"
+          cp -R "$APP" "$OUT/mvp7b-sample-ipa/Payload/"
+          (cd "$OUT/mvp7b-sample-ipa" && zip -qry ../MVP7B-Sample-Guide.ipa Payload)
+          test -f "$OUT/MVP7B-Sample-Guide.ipa"
 
       - name: Download pinned NuvioTV unsigned IPA
         working-directory: tvOS/ProbeMVP0
@@ -86,27 +86,27 @@ jobs:
         run: |
           set -euo pipefail
           python3 Tools/lctv_ipa_analyze.py \
-            out/MVP7-Sample-Guide.ipa \
-            --json-out out/MVP7-Sample-analysis.json | tee out/MVP7-Sample-analysis.txt
+            out/MVP7B-Sample-Guide.ipa \
+            --json-out out/MVP7B-Sample-analysis.json | tee out/MVP7B-Sample-analysis.txt
 
           python3 Tools/lctv_ipa_analyze.py \
             out/NuvioTV-3.3.3-unsigned-release.ipa \
-            --json-out out/MVP7-Nuvio-analysis.json | tee out/MVP7-Nuvio-analysis.txt
+            --json-out out/MVP7B-Nuvio-analysis.json | tee out/MVP7B-Nuvio-analysis.txt
 
           python3 - <<'PY'
           import json
           from pathlib import Path
           for name in ('Sample', 'Nuvio'):
-              report = json.loads(Path(f'out/MVP7-{name}-analysis.json').read_text())
+              report = json.loads(Path(f'out/MVP7B-{name}-analysis.json').read_text())
               assert report['compatible_for_mvp5'] is True, report
               assert report['macho']['arm64'] is True, report
               assert report['macho']['filetype_name'] == 'MH_EXECUTE', report
               assert report['macho']['lc_main'], report
               assert not report['macho']['encrypted'], report
-              print(f'MVP7 ANALYZE PASS {name}:', report['app']['display_name'], report['app']['bundle_id'])
+              print(f'MVP7B ANALYZE PASS {name}:', report['app']['display_name'], report['app']['bundle_id'])
           PY
 
-      - name: Prepare generic guest bundles
+      - name: Prepare generic guest seed bundles
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
@@ -114,27 +114,26 @@ jobs:
 
           LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
             bash Tools/lctv_prepare_ipa.sh \
-              out/MVP7-Sample-Guide.ipa \
-              out/mvp7-sample-prepared
+              out/MVP7B-Sample-Guide.ipa \
+              out/mvp7b-sample-prepared
           python3 Tools/lctv_wrap_guest_framework.py \
-            out/mvp7-sample-prepared \
+            out/mvp7b-sample-prepared \
             out/ControlGuest.framework
 
           LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch" \
             bash Tools/lctv_prepare_ipa.sh \
               out/NuvioTV-3.3.3-unsigned-release.ipa \
-              out/mvp7-nuvio-prepared
+              out/mvp7b-nuvio-prepared
           python3 Tools/lctv_wrap_guest_framework.py \
-            out/mvp7-nuvio-prepared \
+            out/mvp7b-nuvio-prepared \
             out/MediaGuest.framework
 
           mkdir -p out/MediaGuest.framework/Licenses/NuvioTVOS
           cp out/nuvio-license/LICENSE.txt out/MediaGuest.framework/Licenses/NuvioTVOS/
           cp out/nuvio-license/SOURCE.txt out/MediaGuest.framework/Licenses/NuvioTVOS/
-
           test ! -d out/MediaGuest.framework/PlugIns
 
-      - name: Build MVP7 dynamic-library host
+      - name: Build MVP7B writable-store host
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
@@ -145,35 +144,37 @@ jobs:
             -configuration Release \
             -sdk appletvos \
             -destination 'generic/platform=tvOS' \
-            -derivedDataPath build-mvp7-host \
+            -derivedDataPath build-mvp7b-host \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            build | tee out/mvp7-host-xcodebuild.log
+            build | tee out/mvp7b-host-xcodebuild.log
 
-      - name: Prove MVP7 source has no app-specific catalog
+      - name: Prove MVP7B uses a writable dynamic guest store
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
           ! grep -E 'MVP6SampleGuest|MVP6NuvioGuest|NuvioTV 3\.3\.3|tvOS Sample Guide \(control\)' AppHost/MVP7Main.m
           grep -q 'LCTVPreparedGuest' AppHost/MVP7Main.m
-          grep -q 'contentsOfDirectoryAtURL' AppHost/MVP7Main.m
-          echo 'MVP7 DYNAMIC CATALOG SOURCE PASS'
+          grep -q 'Application Support/LiveContainerTV/GuestStore' AppHost/MVP7Main.m
+          grep -q 'copyItemAtURL' AppHost/MVP7Main.m
+          grep -q 'LCTVWritableGuestStoreURL' AppHost/MVP7Main.m
+          echo 'MVP7B WRITABLE STORE SOURCE PASS'
 
-      - name: Stage prepared guests without catalog changes
+      - name: Stage signed seed guests for first-run migration
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
-          HOST='build-mvp7-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          HOST='build-mvp7b-host/Build/Products/Release-appletvos/LiveContainerTV.app'
           test -d "$HOST"
           mkdir -p "$HOST/Frameworks"
           cp -R out/ControlGuest.framework "$HOST/Frameworks/ControlGuest.framework"
           cp -R out/MediaGuest.framework "$HOST/Frameworks/MediaGuest.framework"
 
-          python3 - <<'PY' | tee out/MVP7-Catalog.txt
+          python3 - <<'PY' | tee out/MVP7B-Seed-Catalog.txt
           import plistlib
           from pathlib import Path
 
-          root = Path('build-mvp7-host/Build/Products/Release-appletvos/LiveContainerTV.app/Frameworks')
+          root = Path('build-mvp7b-host/Build/Products/Release-appletvos/LiveContainerTV.app/Frameworks')
           guests = []
           for fw in sorted(root.glob('*.framework')):
               info_path = fw / 'Info.plist'
@@ -189,7 +190,7 @@ jobs:
           assert len(guests) == 2, guests
           for fw, name, bundle_id in guests:
               print(f'{fw}\t{name}\t{bundle_id}')
-          print(f'MVP7 DISCOVERY FIXTURE PASS: {len(guests)} prepared guests')
+          print(f'MVP7B SEED FIXTURE PASS: {len(guests)} prepared guests')
           PY
 
           for FW in ControlGuest MediaGuest; do
@@ -198,26 +199,26 @@ jobs:
             python3 Tools/verify_macho.py "$HOST/Frameworks/$FW.framework/$EXEC"
           done
 
-      - name: Package MVP7 dynamic-library IPA
+      - name: Package MVP7B writable-store IPA
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
-          HOST='build-mvp7-host/Build/Products/Release-appletvos/LiveContainerTV.app'
-          rm -rf out/mvp7-host-ipa
-          mkdir -p out/mvp7-host-ipa/Payload
-          cp -R "$HOST" out/mvp7-host-ipa/Payload/
-          (cd out/mvp7-host-ipa && zip -qry ../LiveContainerTV-MVP7-DynamicLibrary.ipa Payload)
-          test -f out/LiveContainerTV-MVP7-DynamicLibrary.ipa
-          shasum -a 256 out/LiveContainerTV-MVP7-DynamicLibrary.ipa | tee out/MVP7-IPA-SHA256.txt
+          HOST='build-mvp7b-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out/mvp7b-host-ipa
+          mkdir -p out/mvp7b-host-ipa/Payload
+          cp -R "$HOST" out/mvp7b-host-ipa/Payload/
+          (cd out/mvp7b-host-ipa && zip -qry ../LiveContainerTV-MVP7B-WritableStore.ipa Payload)
+          test -f out/LiveContainerTV-MVP7B-WritableStore.ipa
+          shasum -a 256 out/LiveContainerTV-MVP7B-WritableStore.ipa | tee out/MVP7B-IPA-SHA256.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MVP7-Dynamic-Guest-Library
+          name: MVP7B-Writable-Guest-Store
           path: |
-            tvOS/ProbeMVP0/out/LiveContainerTV-MVP7-DynamicLibrary.ipa
-            tvOS/ProbeMVP0/out/MVP7-IPA-SHA256.txt
-            tvOS/ProbeMVP0/out/MVP7-Catalog.txt
-            tvOS/ProbeMVP0/out/MVP7-Sample-analysis.json
-            tvOS/ProbeMVP0/out/MVP7-Nuvio-analysis.json
-            tvOS/ProbeMVP0/out/mvp7-host-xcodebuild.log
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP7B-WritableStore.ipa
+            tvOS/ProbeMVP0/out/MVP7B-IPA-SHA256.txt
+            tvOS/ProbeMVP0/out/MVP7B-Seed-Catalog.txt
+            tvOS/ProbeMVP0/out/MVP7B-Sample-analysis.json
+            tvOS/ProbeMVP0/out/MVP7B-Nuvio-analysis.json
+            tvOS/ProbeMVP0/out/mvp7b-host-xcodebuild.log
             tvOS/ProbeMVP0/out/nuvio-license/**
