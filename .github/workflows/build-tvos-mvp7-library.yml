@@ -155,7 +155,7 @@ jobs:
           set -euo pipefail
           ! grep -E 'MVP6SampleGuest|MVP6NuvioGuest|NuvioTV 3\.3\.3|tvOS Sample Guide \(control\)' AppHost/MVP7Main.m
           grep -q 'LCTVPreparedGuest' AppHost/MVP7Main.m
-          grep -q 'Application Support/LiveContainerTV/GuestStore' AppHost/MVP7Main.m
+          grep -q 'Library/Caches/LiveContainerTV/GuestStore' AppHost/MVP7Main.m
           grep -q 'copyItemAtURL' AppHost/MVP7Main.m
           grep -q 'LCTVWritableGuestStoreURL' AppHost/MVP7Main.m
           echo 'MVP7B WRITABLE STORE SOURCE PASS'
