@@ -18,11 +18,23 @@ if [ ! -f "$IPA" ]; then
   echo "input IPA not found: $IPA" >&2
   exit 1
 fi
-if [ ! -x "$PATCHER" ]; then
-  echo "Mach-O patcher not executable: $PATCHER" >&2
-  echo "build it first or set LCTV_PATCHER=/path/to/lctv_macho_patch" >&2
+if [ ! -f "$PATCHER" ]; then
+  echo "Mach-O patcher not found: $PATCHER" >&2
+  echo "set LCTV_PATCHER to the C binary or portable lctv_macho_patch.py" >&2
   exit 1
 fi
+
+run_patcher() {
+  if [[ "$PATCHER" == *.py ]]; then
+    python3 "$PATCHER" "$1"
+  else
+    if [ ! -x "$PATCHER" ]; then
+      echo "Mach-O patcher is not executable: $PATCHER" >&2
+      exit 1
+    fi
+    "$PATCHER" "$1"
+  fi
+}
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -34,7 +46,6 @@ python3 "$ANALYZER" "$IPA" > "$OUT/analysis.txt"
 
 python3 - "$IPA" "$TMP" "$OUT" <<'PY'
 import json
-import os
 import plistlib
 import shutil
 import sys
@@ -100,13 +111,24 @@ PY
 
 cp "$EXEC_PATH" "$OUT/original-executable"
 chmod +x "$EXEC_PATH"
-"$PATCHER" "$EXEC_PATH" | tee "$OUT/patch.log"
+run_patcher "$EXEC_PATH" | tee "$OUT/patch.log"
 python3 "$VERIFY" "$EXEC_PATH" | tee "$OUT/verify.log"
+
+python3 - "$EXEC_PATH" <<'PY' | tee "$OUT/executable-sha256.txt"
+import hashlib, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+h = hashlib.sha256()
+with p.open('rb') as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b''):
+        h.update(chunk)
+print(h.hexdigest(), p)
+PY
 
 echo "--- prepared guest ---" | tee "$OUT/summary.txt"
 echo "IPA=$IPA" | tee -a "$OUT/summary.txt"
 echo "APP=$(dirname "$EXEC_PATH")" | tee -a "$OUT/summary.txt"
 echo "EXEC=$EXEC_PATH" | tee -a "$OUT/summary.txt"
-shasum -a 256 "$EXEC_PATH" | tee -a "$OUT/summary.txt"
+cat "$OUT/executable-sha256.txt" | tee -a "$OUT/summary.txt"
 
 echo "MVP5B PASS: IPA analyzed, extracted, de-profiled, patched MH_EXECUTE -> MH_DYLIB, and verified"
