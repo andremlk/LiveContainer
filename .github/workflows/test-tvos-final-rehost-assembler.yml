@@ -1,0 +1,166 @@
+name: Final Rehost Assembler Safety Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-final-assembler-prep]
+    paths:
+      - 'tvOS/ProbeMVP0/Tools/lctv_rehost_update.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_registry_from_host.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_assemble_update.py'
+      - '.github/workflows/test-tvos-final-rehost-assembler.yml'
+
+concurrency:
+  group: tvos-final-rehost-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  safety-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install archive tools
+        run: |
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y --no-install-recommends zip unzip >/dev/null
+
+      - name: Build synthetic current container and replacement host template
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf out/rehost-test
+          mkdir -p out/rehost-test/current/Payload/LiveContainerTV.app/Frameworks/TestGuest.framework
+          mkdir -p out/rehost-test/current/Payload/LiveContainerTV.app/GuestSeeds/TestGuest.resources
+          mkdir -p out/rehost-test/new/Payload/LiveContainerTV.app/_CodeSignature
+
+          python3 - <<'PY'
+          import json, plistlib
+          from pathlib import Path
+
+          current=Path('out/rehost-test/current/Payload/LiveContainerTV.app')
+          new=Path('out/rehost-test/new/Payload/LiveContainerTV.app')
+          slot=current/'Frameworks/TestGuest.framework'
+          seed=current/'GuestSeeds/TestGuest.resources'
+          fp='fixture-fingerprint-v1'
+
+          current_info={
+              'CFBundleIdentifier':'dev.andre.livecontainertv.mvp3',
+              'CFBundleName':'LiveContainerTV',
+              'CFBundleDisplayName':'LiveContainerTV',
+              'CFBundleExecutable':'LiveContainerTV',
+              'CFBundlePackageType':'APPL',
+              'CFBundleShortVersionString':'7.9',
+              'CFBundleVersion':'79',
+          }
+          (current/'Info.plist').write_bytes(plistlib.dumps(current_info))
+          (current/'LiveContainerTV').write_bytes(b'OLD-HOST-BINARY')
+
+          slot_info={
+              'CFBundleIdentifier':'dev.lctv.slot.testguest',
+              'CFBundleExecutable':'TestGuest',
+              'CFBundlePackageType':'FMWK',
+              'LCTVCodeSlot':True,
+              'LCTVGuestExecutable':'TestGuest',
+              'LCTVGuestBundleIdentifier':'com.example.testguest',
+              'LCTVImportFingerprint':fp,
+          }
+          seed_info={
+              'CFBundleIdentifier':'com.example.testguest',
+              'CFBundlePackageType':'BNDL',
+              'LCTVResourceSeed':True,
+              'LCTVImportFingerprint':fp,
+          }
+          (slot/'Info.plist').write_bytes(plistlib.dumps(slot_info))
+          (slot/'TestGuest').write_bytes(b'SIGNED-GUEST-CODE-FIXTURE')
+          (seed/'Info.plist').write_bytes(plistlib.dumps(seed_info))
+          (seed/'asset.txt').write_text('guest resource survives rehost\n')
+
+          catalog={
+              'format':1,
+              'guests':[{
+                  'bundleID':'com.example.testguest',
+                  'displayName':'Test Guest',
+                  'executable':'TestGuest',
+                  'fingerprint':fp,
+                  'codeSlot':'CodeSlots/TestGuest.framework',
+                  'resourceSeed':'ResourceSeeds/TestGuest.resources',
+                  'nestedFrameworks':0,
+              }],
+          }
+          (current/'LCTVImportCatalog.json').write_text(json.dumps(catalog, indent=2, sort_keys=True)+'\n')
+
+          new_info={
+              'CFBundleIdentifier':'dev.livecontainertv.probe',
+              'CFBundleName':'ProbeTemplate',
+              'CFBundleDisplayName':'ProbeTemplate',
+              'CFBundleExecutable':'LiveContainerTV',
+              'CFBundlePackageType':'APPL',
+              'CFBundleShortVersionString':'8.0',
+              'CFBundleVersion':'80',
+          }
+          (new/'Info.plist').write_bytes(plistlib.dumps(new_info))
+          (new/'LiveContainerTV').write_bytes(b'NEW-HOST-BINARY')
+          (new/'embedded.mobileprovision').write_bytes(b'STALE-PROVISION')
+          (new/'_CodeSignature/CodeResources').write_bytes(b'STALE-SIGNATURE')
+          PY
+
+          (cd out/rehost-test/current && zip -qry ../current.ipa Payload)
+          (cd out/rehost-test/new && zip -qry ../new-host.ipa Payload)
+
+      - name: Rehost while preserving installed identity and catalog
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 Tools/lctv_rehost_update.py \
+            out/rehost-test/current.ipa \
+            out/rehost-test/new-host.ipa \
+            out/rehost-test/final-unsigned.ipa \
+            --expected-bundle-id dev.andre.livecontainertv.mvp3 | tee out/rehost-test/rehost.log
+
+      - name: Verify final-update invariants
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf out/rehost-test/verify
+          unzip -q out/rehost-test/final-unsigned.ipa -d out/rehost-test/verify
+          python3 - <<'PY' | tee out/rehost-test/verification.txt
+          import json, plistlib
+          from pathlib import Path
+          app=Path('out/rehost-test/verify/Payload/LiveContainerTV.app')
+          info=plistlib.loads((app/'Info.plist').read_bytes())
+          assert info['CFBundleIdentifier']=='dev.andre.livecontainertv.mvp3', info
+          assert info['CFBundleShortVersionString']=='8.0', info
+          assert (app/'LiveContainerTV').read_bytes()==b'NEW-HOST-BINARY'
+          assert not (app/'_CodeSignature').exists()
+          assert not (app/'embedded.mobileprovision').exists()
+
+          catalog=json.loads((app/'LCTVImportCatalog.json').read_text())
+          assert [g['bundleID'] for g in catalog['guests']]==['com.example.testguest'], catalog
+          assert (app/'Frameworks/TestGuest.framework/TestGuest').read_bytes()==b'SIGNED-GUEST-CODE-FIXTURE'
+          assert (app/'GuestSeeds/TestGuest.resources/asset.txt').read_text().strip()=='guest resource survives rehost'
+          assert not (app/'GuestSeeds/TestGuest.resources/TestGuest').exists()
+          assert not (app/'GuestSeeds/TestGuest.resources/Frameworks').exists()
+
+          update=json.loads((app/'LCTVUpdateManifest.json').read_text())
+          assert update['preserved']==['com.example.testguest'], update
+          assert update['added']==[] and update['updated']==[] and update['removed']==[], update
+
+          rehost=json.loads((app/'LCTVRehostManifest.json').read_text())
+          assert rehost['outerBundleIdentifier']=='dev.andre.livecontainertv.mvp3', rehost
+          assert rehost['templateOriginalBundleIdentifier']=='dev.livecontainertv.probe', rehost
+          assert rehost['guestCount']==1, rehost
+          assert rehost['signingRequired'] is True, rehost
+          print('FINAL REHOST ASSEMBLER SAFETY PASS')
+          print('outer bundle ID preserved:', info['CFBundleIdentifier'])
+          print('new host binary installed; existing guest preserved')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Final-Rehost-Assembler-Safety-Test
+          path: |
+            tvOS/ProbeMVP0/out/rehost-test/final-unsigned.ipa
+            tvOS/ProbeMVP0/out/rehost-test/rehost.log
+            tvOS/ProbeMVP0/out/rehost-test/verification.txt
+          if-no-files-found: error
