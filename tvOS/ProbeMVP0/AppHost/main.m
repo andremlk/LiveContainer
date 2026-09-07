@@ -10,6 +10,7 @@
 
 static NSString * const LCTVBootUIKitGuestNextLaunchKey = @"LCTVBootUIKitGuestNextLaunch";
 static NSString * const LCTVIdentityProbeModeNextLaunchKey = @"LCTVIdentityProbeModeNextLaunch";
+static NSString * const LCTVBootExternalGuestNextLaunchKey = @"LCTVBootExternalGuestNextLaunch";
 static NSString * const LCTVLastMVP3ResultKey = @"LCTVLastMVP3Result";
 
 typedef int (*LCTVGuestMainFn)(int, char **);
@@ -46,6 +47,25 @@ static NSString *LCTVFrameworkExecutablePath(NSString *frameworkName, NSString *
     if (!frameworksURL) return nil;
     NSString *relative = [NSString stringWithFormat:@"%@.framework/%@", frameworkName, executableName];
     return [[frameworksURL URLByAppendingPathComponent:relative] path];
+}
+
+static NSString *LCTVExternalGuestBundlePath(void) {
+    NSURL *frameworksURL = NSBundle.mainBundle.privateFrameworksURL;
+    if (!frameworksURL) return nil;
+    return [[frameworksURL URLByAppendingPathComponent:@"MVP5ExternalGuest.framework"] path];
+}
+
+static NSBundle *LCTVExternalGuestBundle(void) {
+    NSString *bundlePath = LCTVExternalGuestBundlePath();
+    if (!bundlePath.length) return nil;
+    return [NSBundle bundleWithPath:bundlePath];
+}
+
+static NSString *LCTVExternalGuestExecutablePath(void) {
+    NSBundle *bundle = LCTVExternalGuestBundle();
+    NSString *executable = bundle.infoDictionary[@"CFBundleExecutable"];
+    if (!bundle || !executable.length) return nil;
+    return [bundle.bundlePath stringByAppendingPathComponent:executable];
 }
 
 static NSString *LCTVRunFrameworkProbe(void) {
@@ -359,6 +379,78 @@ static int LCTVBootUIKitGuestColdStart(int argc, char *argv[], NSInteger identit
     return result;
 }
 
+static int LCTVBootExternalGuestColdStart(int argc, char *argv[], NSString **errorOut) {
+    NSBundle *guestBundle = LCTVExternalGuestBundle();
+    NSString *guestPath = LCTVExternalGuestExecutablePath();
+    if (!guestBundle || !guestPath.length) {
+        if (errorOut) *errorOut = @"MVP5ExternalGuest.framework is not staged in the host IPA";
+        return INT_MIN;
+    }
+    if (![NSFileManager.defaultManager fileExistsAtPath:guestPath]) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"external guest executable missing at %@", guestPath];
+        return INT_MIN;
+    }
+
+    NSString *bundleID = guestBundle.bundleIdentifier ?: @"mvp5.external.guest";
+    NSString *processName = guestBundle.infoDictionary[@"CFBundleExecutable"] ?: guestPath.lastPathComponent;
+    NSString *bundlePath = guestBundle.bundlePath;
+
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setObject:[NSString stringWithFormat:@"MVP5C STARTED: dlopen external guest %@", processName]
+                  forKey:LCTVLastMVP3ResultKey];
+    [defaults synchronize];
+
+    dlerror();
+    void *handle = dlopen(guestPath.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+        const char *error = dlerror();
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"external dlopen failed: %s", error ?: "unknown error"];
+        return INT_MIN;
+    }
+
+    const struct mach_header_64 *guestHeader = NULL;
+    uint64_t entryOffset = 0;
+    NSString *resolveError = nil;
+    LCTVGuestMainFn guestMain = LCTVResolveGuestMainForPath(guestPath, &guestHeader, &entryOffset, &resolveError);
+    if (!guestMain) {
+        if (errorOut) *errorOut = resolveError ?: @"external LC_MAIN resolution failed";
+        dlclose(handle);
+        return INT_MIN;
+    }
+
+    [defaults setObject:[NSString stringWithFormat:@"MVP5C STARTED: external dlopen PASS; LC_MAIN=0x%llx; applying host identity",
+                         (unsigned long long)entryOffset]
+                  forKey:LCTVLastMVP3ResultKey];
+    [defaults synchronize];
+
+    const char *hostHomeCString = getenv("HOME");
+    if (!hostHomeCString) {
+        if (errorOut) *errorOut = @"host HOME unavailable before external bootstrap";
+        dlclose(handle);
+        return INT_MIN;
+    }
+    NSString *hostHome = [NSString stringWithUTF8String:hostHomeCString];
+    NSString *safeID = [bundleID stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    NSString *guestHome = [hostHome stringByAppendingPathComponent:[NSString stringWithFormat:@"Library/Caches/LiveContainerTV/Guests/%@/Data", safeID]];
+
+    unsetenv("LCTV_HOST_PREMAIN_PROBE");
+    NSString *runtimeError = nil;
+    BOOL runtimeOK = LCTVApplyHostGuestIdentity(guestHeader,
+                                                 bundlePath,
+                                                 guestPath,
+                                                 bundleID,
+                                                 processName,
+                                                 guestHome,
+                                                 &runtimeError);
+    setenv("LCTV_MVP5_EXTERNAL_RUNTIME_OK", runtimeOK ? "1" : "0", 1);
+    if (runtimeError.length) setenv("LCTV_MVP5_EXTERNAL_RUNTIME_ERROR", runtimeError.UTF8String, 1);
+
+    if (argc > 0 && argv) argv[0] = (char *)guestPath.fileSystemRepresentation;
+    int result = guestMain(argc, argv);
+    dlclose(handle);
+    return result;
+}
+
 static UIButton *LCTVButton(NSString *title, id target, SEL action) {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.translatesAutoresizingMaskIntoConstraints = NO;
@@ -399,8 +491,10 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
     UIButton *entryButton = LCTVButton(@"MVP2B: execute LC_MAIN", self, @selector(runLCMainProbe:));
     UIButton *baselineButton = LCTVButton(@"MVP3: baseline UIKit guest", self, @selector(armBaseline:));
     UIButton *hostPreMainButton = LCTVButton(@"MVP5P: host pre-main identity", self, @selector(armHostPreMain:));
+    UIButton *externalButton = LCTVButton(@"MVP5C: external tvOS app", self, @selector(armExternalGuest:));
+    externalButton.enabled = LCTVExternalGuestBundle() != nil;
 
-    UIStackView *left = [[UIStackView alloc] initWithArrangedSubviews:@[frameworkButton, patchedButton, entryButton, baselineButton, hostPreMainButton]];
+    UIStackView *left = [[UIStackView alloc] initWithArrangedSubviews:@[frameworkButton, patchedButton, entryButton, baselineButton, hostPreMainButton, externalButton]];
     left.axis = UILayoutConstraintAxisVertical;
     left.spacing = 12.0;
     left.alignment = UIStackViewAlignmentCenter;
@@ -473,6 +567,15 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 - (void)armProcessName:(id)sender { (void)sender; [self armMode:LCTVIdentityProbeModeProcessName]; }
 - (void)armAll:(id)sender { (void)sender; [self armMode:LCTVIdentityProbeModeAll]; }
 - (void)armHostPreMain:(id)sender { (void)sender; [self armMode:LCTVIdentityProbeModeHostPreMain]; }
+- (void)armExternalGuest:(id)sender {
+    (void)sender;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setBool:YES forKey:LCTVBootExternalGuestNextLaunchKey];
+    NSString *message = @"MVP5C EXTERNAL ARMED: force-close LiveContainerTV, then reopen it. This mode is one-shot.";
+    [defaults setObject:message forKey:LCTVLastMVP3ResultKey];
+    [defaults synchronize];
+    self.statusLabel.text = message;
+}
 @end
 
 @interface LCTVAppDelegate : UIResponder <UIApplicationDelegate>
@@ -493,6 +596,22 @@ static UIButton *LCTVButton(NSString *title, id target, SEL action) {
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+
+        if ([defaults boolForKey:LCTVBootExternalGuestNextLaunchKey]) {
+            [defaults removeObjectForKey:LCTVBootExternalGuestNextLaunchKey];
+            [defaults setObject:@"MVP5C STARTED: cold-start loader entered before host UIApplicationMain"
+                          forKey:LCTVLastMVP3ResultKey];
+            [defaults synchronize];
+
+            NSString *bootError = nil;
+            int guestResult = LCTVBootExternalGuestColdStart(argc, argv, &bootError);
+            if (guestResult != INT_MIN) return guestResult;
+
+            NSString *failure = [NSString stringWithFormat:@"FAIL MVP5C external cold-start: %@", bootError ?: @"unknown error"];
+            [defaults setObject:failure forKey:LCTVLastMVP3ResultKey];
+            [defaults synchronize];
+        }
+
         if ([defaults boolForKey:LCTVBootUIKitGuestNextLaunchKey]) {
             NSInteger mode = [defaults integerForKey:LCTVIdentityProbeModeNextLaunchKey];
             [defaults removeObjectForKey:LCTVBootUIKitGuestNextLaunchKey];
