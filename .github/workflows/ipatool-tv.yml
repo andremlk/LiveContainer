@@ -59,18 +59,20 @@ jobs:
           device.write_text(text)
           PY
 
-          echo '--- Patched platforms ---'
+          echo '--- Patched ApplePackage for tvOS ---'
           grep -n 'tvOS\|iOS' Vendor/ApplePackage/Package.swift | head
           grep -n '#if os' Vendor/ApplePackage/Sources/ApplePackage/Configuration/DeviceIdentifier.swift | head
 
       - name: Generate Xcode project
         run: |
+          set -euo pipefail
           cd IPAToolTV
           xcodegen generate
-          xcodebuild -project IPAToolTV.xcodeproj -scheme IPAToolTV -showdestinations
+          test -f IPAToolTV.xcodeproj/project.pbxproj
 
       - name: Resolve packages
         run: |
+          set -euo pipefail
           cd IPAToolTV
           xcodebuild \
             -resolvePackageDependencies \
