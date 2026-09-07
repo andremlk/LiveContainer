@@ -7,10 +7,10 @@ on:
     paths:
       - 'tvOS/ProbeMVP0/**'
       - '.github/workflows/build-tvos-mvp0.yml'
-  pull_request:
-    paths:
-      - 'tvOS/ProbeMVP0/**'
-      - '.github/workflows/build-tvos-mvp0.yml'
+
+concurrency:
+  group: tvos-prototype-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
