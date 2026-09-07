@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 FORMAT_VERSION = 1
+TRANSFORM_VERSION = 2
 
 
 def sha256_file(path: Path) -> str:
@@ -120,6 +121,7 @@ def main():
 
     source_sha256 = sha256_file(ipa)
     fingerprint_input = json.dumps({
+        'transformVersion': TRANSFORM_VERSION,
         'sourceSHA256': source_sha256,
         'bundleID': bundle_id,
         'version': version,
@@ -134,6 +136,7 @@ def main():
     seed_info = plistlib.loads(seed_info_path.read_bytes())
     for info in (slot_info, seed_info):
         info['LCTVImporterFormat'] = FORMAT_VERSION
+        info['LCTVImportTransformVersion'] = TRANSFORM_VERSION
         info['LCTVImportFingerprint'] = fingerprint
         info['LCTVImportSourceSHA256'] = source_sha256
     slot_info['LCTVResourceSeedName'] = seed_name
@@ -151,6 +154,7 @@ def main():
 
     record = {
         'format': FORMAT_VERSION,
+        'transformVersion': TRANSFORM_VERSION,
         'bundleID': bundle_id,
         'displayName': display_name,
         'executable': executable,
