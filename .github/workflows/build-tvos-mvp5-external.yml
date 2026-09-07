@@ -5,11 +5,11 @@ on:
   push:
     branches: [tvos-mvp0]
     paths:
-      - 'tvOS/ProbeMVP0/Tools/**'
+      - 'tvOS/ProbeMVP0/**'
       - '.github/workflows/build-tvos-mvp5-external.yml'
   pull_request:
     paths:
-      - 'tvOS/ProbeMVP0/Tools/**'
+      - 'tvOS/ProbeMVP0/**'
       - '.github/workflows/build-tvos-mvp5-external.yml'
 
 jobs:
@@ -17,6 +17,9 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
 
       - name: Build LiveContainerTV Mach-O patcher
         working-directory: tvOS/ProbeMVP0
@@ -108,6 +111,49 @@ jobs:
           otool -L "out/MVP5ExternalGuest.framework/$EXEC" | tee out/MVP5-External-dependencies.txt
           echo "MVP5B EXTERNAL PASS: external app is patched and signer-discoverable as framework guest"
 
+      - name: Build LiveContainerTV host with MVP5 runtime
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme LiveContainerTV \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp5-host \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp5-host-xcodebuild.log
+
+      - name: Stage external guest inside LiveContainerTV
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp5-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          DEST="$HOST/Frameworks/MVP5ExternalGuest.framework"
+          rm -rf "$DEST"
+          cp -R out/MVP5ExternalGuest.framework "$DEST"
+
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$DEST/Info.plist")"
+          TYPE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$DEST/Info.plist")"
+          test "$TYPE" = 'FMWK'
+          test -f "$DEST/$EXEC"
+          python3 Tools/verify_macho.py "$DEST/$EXEC"
+          echo "MVP5C STAGING PASS: external guest embedded at Frameworks/MVP5ExternalGuest.framework/$EXEC"
+
+      - name: Package staged LiveContainerTV IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp5-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out/mvp5-host-ipa
+          mkdir -p out/mvp5-host-ipa/Payload
+          cp -R "$HOST" out/mvp5-host-ipa/Payload/
+          (cd out/mvp5-host-ipa && zip -qry ../LiveContainerTV-MVP5-External-Staged.ipa Payload)
+          test -f out/LiveContainerTV-MVP5-External-Staged.ipa
+
       - uses: actions/upload-artifact@v4
         with:
           name: MVP5-External-Candidate
@@ -118,4 +164,6 @@ jobs:
             tvOS/ProbeMVP0/out/MVP5-External-dependencies.txt
             tvOS/ProbeMVP0/out/mvp5-external-prepared/**
             tvOS/ProbeMVP0/out/MVP5ExternalGuest.framework/**
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP5-External-Staged.ipa
             tvOS/ProbeMVP0/out/mvp5-external-xcodebuild.log
+            tvOS/ProbeMVP0/out/mvp5-host-xcodebuild.log
