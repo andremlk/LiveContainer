@@ -12,7 +12,7 @@ on:
 jobs:
   build-tvos:
     name: Build unsigned tvOS IPA
-    runs-on: macos-26
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
@@ -23,7 +23,7 @@ jobs:
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '26.0'
+          xcode-version: '26.2'
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -103,7 +103,6 @@ jobs:
           mkdir Payload
           cp -R "$APP_PATH" Payload/
           zip -qry IPAToolTV-MVP-unsigned.ipa Payload
-          unzip -p IPAToolTV-MVP-unsigned.ipa Payload/IPAToolTV.app/Info.plist > /tmp/IPAToolTV-Info.plist || true
           ls -lh IPAToolTV-MVP-unsigned.ipa
 
       - name: Upload IPA
