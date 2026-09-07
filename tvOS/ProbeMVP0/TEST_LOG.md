@@ -283,17 +283,24 @@ Stable guest data root:
 
 Known tvOS limitation: Caches may be purgeable, so backup/recovery remains a future requirement.
 
-## MVP7J — JIT experiment (planned)
+## MVP7J — JIT experiment
 
 Objective: investigate whether JIT can remove or reduce the signed-code-slot requirement.
 
 Upstream LiveContainer detects JIT through process debug state (`CS_DEBUGGED`) and uses JIT to enable its dyld/library-validation bypass before loading guests.
 
-Planned sequence:
+Implemented host-side probe work:
+
+1. runtime `CS_DEBUGGED` telemetry
+2. live status overlay on the MVP7H-compatible launcher
+3. explicit arm64 executable-memory probe (`mov w0,#42; ret`) only after debug/JIT state is present
+4. host-template build that can be rebased into the user's existing imported-guest IPA without replacing CodeSlots/GuestSeeds/catalog
+
+Remaining hardware sequence:
 
 1. Enable JIT for the LiveContainerTV process over the existing remote pairing/RSD path.
-2. Verify `CS_DEBUGGED` / JIT state inside LiveContainerTV.
-3. Run a small executable-memory JIT probe.
+2. Verify `CS_DEBUGGED=YES` inside LiveContainerTV.
+3. Run the executable-memory probe and require return `42`.
 4. Port/test upstream dyld library-validation bypass on tvOS 18.6.
 5. Place a tiny transformed guest executable in writable Caches instead of the signed slot.
 6. Attempt `dlopen` from writable storage with JIT enabled.
@@ -315,6 +322,21 @@ When back at the Apple TV:
 3. verify `store=PASS`
 4. launch Infuse
 5. record the next runtime result
+6. rebase the new MVP7J host while preserving all current guest slots
+7. verify JIT overlay shows `CS_DEBUGGED=NO` before attaching a debugger/JIT enabler
+
+## DO NOT REPEAT — known failed/invalid approaches
+
+These results are treated as closed unless a future OS/JIT change explicitly gives a reason to revisit them:
+
+- **Global dyld `_NSGetExecutablePath` mutation:** crashes. Use the guest-scoped identity bridge only.
+- **Physical executable copy into writable Caches without JIT:** fails with `code signature invalid`, even when byte-identical.
+- **Writable symlink to installed signed executable:** sandbox denies the symlink approach used in MVP7C.
+- **Installing an update with unsigned-template ID `dev.livecontainertv.probe`:** creates a second app/sandbox. Use the existing outer signing ID `dev.andre.livecontainertv.mvp3` for in-place hardware updates.
+- **Keeping `SC_Info` in the writable resource seed:** Infuse resource staging fails with a permission error. Strip it during split/import.
+- **Blind `@executable_path/Frameworks -> @loader_path/Frameworks` rewrite when target already exists:** creates duplicate `LC_RPATH` and dyld rejects Infuse. Skip the rewrite when the destination RPATH is already present.
+- **Assuming app extensions work:** they are currently ignored; Infuse `tv_shelf.appex` is not part of the runtime test path.
+- **Assuming Caches is durable storage:** tvOS may purge it. Persistent recovery/backup still needs a separate design.
 
 ## Logging rule
 
