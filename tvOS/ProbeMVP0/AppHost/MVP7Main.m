@@ -10,6 +10,7 @@
 
 static NSString * const LCTVSelectedGuestNextLaunchKey = @"LCTVSelectedGuestNextLaunch";
 static NSString * const LCTVLastMVP7ResultKey = @"LCTVLastMVP7Result";
+static NSString * const LCTVGuestStoreRelativePath = @"Library/Application Support/LiveContainerTV/GuestStore";
 
 typedef int (*LCTVGuestMainFn)(int, char **);
 
@@ -17,29 +18,122 @@ static NSString *LCTVStringValue(id value) {
     return [value isKindOfClass:NSString.class] ? (NSString *)value : nil;
 }
 
-static NSArray<NSDictionary<NSString *, NSString *> *> *LCTVDiscoverGuestCatalog(void) {
-    NSURL *frameworksURL = NSBundle.mainBundle.privateFrameworksURL;
-    if (!frameworksURL) return @[];
+static NSString *LCTVHostHome(void) {
+    const char *home = getenv("HOME");
+    return home ? [NSString stringWithUTF8String:home] : nil;
+}
+
+static NSURL *LCTVWritableGuestStoreURL(void) {
+    NSString *home = LCTVHostHome();
+    if (!home.length) return nil;
+    return [NSURL fileURLWithPath:[home stringByAppendingPathComponent:LCTVGuestStoreRelativePath]
+                      isDirectory:YES];
+}
+
+static BOOL LCTVIsPreparedGuestBundleAtURL(NSURL *url, NSDictionary **infoOut) {
+    if (![url.pathExtension.lowercaseString isEqualToString:@"framework"]) return NO;
+    NSBundle *bundle = [NSBundle bundleWithURL:url];
+    NSDictionary *info = bundle.infoDictionary;
+    if (!bundle || ![info[@"LCTVPreparedGuest"] boolValue]) return NO;
+    NSString *executable = LCTVStringValue(info[@"CFBundleExecutable"]);
+    if (!executable.length) return NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:[url.path stringByAppendingPathComponent:executable]]) return NO;
+    if (infoOut) *infoOut = info;
+    return YES;
+}
+
+static BOOL LCTVSeedNeedsRefresh(NSURL *sourceURL, NSURL *destinationURL) {
+    if (![NSFileManager.defaultManager fileExistsAtPath:destinationURL.path]) return YES;
+
+    NSBundle *sourceBundle = [NSBundle bundleWithURL:sourceURL];
+    NSBundle *destinationBundle = [NSBundle bundleWithURL:destinationURL];
+    NSDictionary *sourceInfo = sourceBundle.infoDictionary;
+    NSDictionary *destinationInfo = destinationBundle.infoDictionary;
+    if (!sourceInfo || !destinationInfo) return YES;
+
+    NSString *sourceID = LCTVStringValue(sourceInfo[@"CFBundleIdentifier"]) ?: @"";
+    NSString *destinationID = LCTVStringValue(destinationInfo[@"CFBundleIdentifier"]) ?: @"";
+    NSString *sourceVersion = LCTVStringValue(sourceInfo[@"CFBundleShortVersionString"]) ?: @"";
+    NSString *destinationVersion = LCTVStringValue(destinationInfo[@"CFBundleShortVersionString"]) ?: @"";
+    NSString *sourceBuild = LCTVStringValue(sourceInfo[@"CFBundleVersion"]) ?: @"";
+    NSString *destinationBuild = LCTVStringValue(destinationInfo[@"CFBundleVersion"]) ?: @"";
+
+    return ![sourceID isEqualToString:destinationID] ||
+           ![sourceVersion isEqualToString:destinationVersion] ||
+           ![sourceBuild isEqualToString:destinationBuild];
+}
+
+static BOOL LCTVEnsureWritableGuestStore(NSString **errorOut) {
+    NSURL *storeURL = LCTVWritableGuestStoreURL();
+    if (!storeURL) {
+        if (errorOut) *errorOut = @"host HOME unavailable while creating writable guest store";
+        return NO;
+    }
+
+    NSError *mkdirError = nil;
+    if (![NSFileManager.defaultManager createDirectoryAtURL:storeURL
+                                withIntermediateDirectories:YES
+                                                 attributes:nil
+                                                      error:&mkdirError]) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"unable to create writable guest store: %@", mkdirError.localizedDescription];
+        return NO;
+    }
+
+    NSURL *seedRoot = NSBundle.mainBundle.privateFrameworksURL;
+    if (!seedRoot) return YES;
 
     NSError *listError = nil;
-    NSArray<NSURL *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtURL:frameworksURL
-                                                           includingPropertiesForKeys:nil
-                                                                              options:NSDirectoryEnumerationSkipsHiddenFiles
-                                                                                error:&listError];
+    NSArray<NSURL *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtURL:seedRoot
+                                                            includingPropertiesForKeys:nil
+                                                                               options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                                                 error:&listError];
+    if (!entries) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"unable to enumerate bundled seed guests: %@", listError.localizedDescription];
+        return NO;
+    }
+
+    for (NSURL *sourceURL in entries) {
+        if (!LCTVIsPreparedGuestBundleAtURL(sourceURL, NULL)) continue;
+
+        NSURL *destinationURL = [storeURL URLByAppendingPathComponent:sourceURL.lastPathComponent isDirectory:YES];
+        if (!LCTVSeedNeedsRefresh(sourceURL, destinationURL)) continue;
+
+        NSError *removeError = nil;
+        if ([NSFileManager.defaultManager fileExistsAtPath:destinationURL.path] &&
+            ![NSFileManager.defaultManager removeItemAtURL:destinationURL error:&removeError]) {
+            if (errorOut) *errorOut = [NSString stringWithFormat:@"unable to refresh %@: %@", sourceURL.lastPathComponent, removeError.localizedDescription];
+            return NO;
+        }
+
+        NSError *copyError = nil;
+        if (![NSFileManager.defaultManager copyItemAtURL:sourceURL toURL:destinationURL error:&copyError]) {
+            if (errorOut) *errorOut = [NSString stringWithFormat:@"unable to seed %@ into writable store: %@", sourceURL.lastPathComponent, copyError.localizedDescription];
+            return NO;
+        }
+    }
+
+    return YES;
+}
+
+static NSArray<NSDictionary<NSString *, NSString *> *> *LCTVDiscoverGuestCatalog(void) {
+    NSURL *storeURL = LCTVWritableGuestStoreURL();
+    if (!storeURL) return @[];
+
+    NSError *listError = nil;
+    NSArray<NSURL *> *entries = [NSFileManager.defaultManager contentsOfDirectoryAtURL:storeURL
+                                                            includingPropertiesForKeys:nil
+                                                                               options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                                                 error:&listError];
     if (!entries) return @[];
 
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *guests = [NSMutableArray array];
     for (NSURL *entry in entries) {
-        if (![entry.pathExtension.lowercaseString isEqualToString:@"framework"]) continue;
+        NSDictionary *info = nil;
+        if (!LCTVIsPreparedGuestBundleAtURL(entry, &info)) continue;
 
         NSBundle *bundle = [NSBundle bundleWithURL:entry];
-        NSDictionary *info = bundle.infoDictionary;
-        if (!bundle || ![info[@"LCTVPreparedGuest"] boolValue]) continue;
-
         NSString *executable = LCTVStringValue(info[@"CFBundleExecutable"]);
-        if (!executable.length) continue;
         NSString *executablePath = [entry.path stringByAppendingPathComponent:executable];
-        if (![NSFileManager.defaultManager fileExistsAtPath:executablePath]) continue;
 
         NSString *displayName = LCTVStringValue(info[@"CFBundleDisplayName"]);
         if (!displayName.length) displayName = LCTVStringValue(info[@"CFBundleName"]);
@@ -59,6 +153,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *LCTVDiscoverGuestCatalog
             @"bundleID": bundleID,
             @"executable": executable,
             @"executablePath": executablePath,
+            @"storage": @"writable",
         } mutableCopy];
         if (version.length) descriptor[@"version"] = version;
         if (build.length) descriptor[@"build"] = build;
@@ -189,7 +284,7 @@ static int LCTVBootGuestColdStart(int argc,
     NSString *guestPath = descriptor[@"executablePath"];
 
     if (!descriptor || !guestBundle || !guestPath.length) {
-        if (errorOut) *errorOut = [NSString stringWithFormat:@"guest %@ is not staged in the host IPA", displayName];
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"guest %@ is not available in the writable guest store", displayName];
         return INT_MIN;
     }
     if (![NSFileManager.defaultManager fileExistsAtPath:guestPath]) {
@@ -201,15 +296,13 @@ static int LCTVBootGuestColdStart(int argc,
     NSString *processName = descriptor[@"executable"] ?: guestPath.lastPathComponent;
     NSString *bundlePath = guestBundle.bundlePath;
 
-    const char *hostHomeCString = getenv("HOME");
-    if (!hostHomeCString) {
+    NSString *hostHome = LCTVHostHome();
+    if (!hostHome.length) {
         if (errorOut) *errorOut = @"host HOME unavailable before guest bootstrap";
         return INT_MIN;
     }
-    NSString *hostHome = [NSString stringWithUTF8String:hostHomeCString];
     NSString *safeID = [[bundleID stringByReplacingOccurrencesOfString:@"/" withString:@"_"]
                         stringByReplacingOccurrencesOfString:@":" withString:@"_"];
-    // Preserve the MVP6 data location so upgrading to MVP7 keeps existing guest state.
     NSString *guestHome = [hostHome stringByAppendingPathComponent:
                            [NSString stringWithFormat:@"Library/Caches/LiveContainerTV/Guests/%@/Data", safeID]];
 
@@ -223,7 +316,7 @@ static int LCTVBootGuestColdStart(int argc,
     }
 
     LCTVStoreResult(hostDefaults,
-                    [NSString stringWithFormat:@"MVP7 %@ STARTED: applying guest identity before dlopen", displayName]);
+                    [NSString stringWithFormat:@"MVP7B %@ STARTED from writable store: applying guest identity before dlopen", displayName]);
 
     unsetenv("LCTV_HOST_PREMAIN_PROBE");
     NSString *preError = nil;
@@ -240,7 +333,7 @@ static int LCTVBootGuestColdStart(int argc,
     void *handle = dlopen(guestPath.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
         const char *error = dlerror();
-        NSString *message = [NSString stringWithFormat:@"FAIL MVP7 %@ dlopen: %s", displayName, error ?: "unknown error"];
+        NSString *message = [NSString stringWithFormat:@"FAIL MVP7B %@ writable-store dlopen: %s", displayName, error ?: "unknown error"];
         LCTVStoreResult(hostDefaults, message);
         if (errorOut) *errorOut = message;
         return 1;
@@ -251,7 +344,7 @@ static int LCTVBootGuestColdStart(int argc,
     NSString *resolveError = nil;
     LCTVGuestMainFn guestMain = LCTVResolveGuestMainForPath(guestPath, &guestHeader, &entryOffset, &resolveError);
     if (!guestMain) {
-        NSString *message = [NSString stringWithFormat:@"FAIL MVP7 %@ LC_MAIN: %@", displayName, resolveError ?: @"unknown error"];
+        NSString *message = [NSString stringWithFormat:@"FAIL MVP7B %@ LC_MAIN: %@", displayName, resolveError ?: @"unknown error"];
         LCTVStoreResult(hostDefaults, message);
         if (errorOut) *errorOut = message;
         dlclose(handle);
@@ -264,7 +357,7 @@ static int LCTVBootGuestColdStart(int argc,
     if (postError.length) setenv("LCTV_MVP7_POST_ERROR", postError.UTF8String, 1);
 
     LCTVStoreResult(hostDefaults,
-                    [NSString stringWithFormat:@"MVP7 %@: jumping to LC_MAIN (entryoff=0x%llx, pre=%@, post=%@)",
+                    [NSString stringWithFormat:@"MVP7B %@: writable-store LC_MAIN entryoff=0x%llx, pre=%@, post=%@",
                      displayName,
                      (unsigned long long)entryOffset,
                      preOK ? @"PASS" : @"PARTIAL",
@@ -306,6 +399,7 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
     } else if (build.length) {
         [metadataParts addObject:[NSString stringWithFormat:@"build %@", build]];
     }
+    [metadataParts addObject:@"writable store"];
 
     UILabel *metadata = [[UILabel alloc] init];
     metadata.translatesAutoresizingMaskIntoConstraints = NO;
@@ -337,7 +431,7 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
 
     UILabel *title = [[UILabel alloc] init];
     title.translatesAutoresizingMaskIntoConstraints = NO;
-    title.text = @"LiveContainerTV — MVP7";
+    title.text = @"LiveContainerTV — MVP7B";
     title.textColor = UIColor.whiteColor;
     title.font = [UIFont boldSystemFontOfSize:52.0];
     title.textAlignment = NSTextAlignmentCenter;
@@ -345,7 +439,7 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
 
     UILabel *subtitle = [[UILabel alloc] init];
     subtitle.translatesAutoresizingMaskIntoConstraints = NO;
-    subtitle.text = @"Dynamic Guest Library — discovered from prepared bundles, no hard-coded app catalog";
+    subtitle.text = @"Writable Guest Store — prepared apps execute from Library/Application Support";
     subtitle.textColor = UIColor.lightGrayColor;
     subtitle.font = [UIFont systemFontOfSize:24.0];
     subtitle.textAlignment = NSTextAlignmentCenter;
@@ -364,7 +458,7 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
 
     if (self.catalog.count == 0) {
         UILabel *empty = [[UILabel alloc] init];
-        empty.text = @"No prepared guests were discovered.";
+        empty.text = @"No prepared guests were discovered in the writable store.";
         empty.textColor = UIColor.systemOrangeColor;
         empty.font = [UIFont systemFontOfSize:28.0 weight:UIFontWeightSemibold];
         [stack addArrangedSubview:empty];
@@ -377,7 +471,7 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     NSString *last = [NSUserDefaults.standardUserDefaults stringForKey:LCTVLastMVP7ResultKey];
-    self.statusLabel.text = last ?: [NSString stringWithFormat:@"Ready. Discovered %lu prepared guest%@.",
+    self.statusLabel.text = last ?: [NSString stringWithFormat:@"Ready. Discovered %lu writable prepared guest%@.",
                                      (unsigned long)self.catalog.count,
                                      self.catalog.count == 1 ? @"" : @"s"];
     self.statusLabel.textColor = UIColor.whiteColor;
@@ -391,18 +485,15 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
         [title.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:46.0],
         [subtitle.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
         [subtitle.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:12.0],
-
         [scroll.topAnchor constraintEqualToAnchor:subtitle.bottomAnchor constant:24.0],
         [scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:80.0],
         [scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-80.0],
         [scroll.bottomAnchor constraintEqualToAnchor:self.statusLabel.topAnchor constant:-24.0],
-
         [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
         [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
         [stack.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor],
         [stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor],
         [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor],
-
         [self.statusLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.leadingAnchor constant:100.0],
         [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.trailingAnchor constant:-100.0],
         [self.statusLabel.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
@@ -414,14 +505,14 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
     NSString *frameworkName = sender.accessibilityIdentifier;
     NSDictionary<NSString *, NSString *> *descriptor = LCTVDescriptorForFrameworkName(frameworkName);
     if (!descriptor) {
-        self.statusLabel.text = [NSString stringWithFormat:@"Guest bundle %@ is no longer available.", frameworkName ?: @"unknown"];
+        self.statusLabel.text = [NSString stringWithFormat:@"Writable guest bundle %@ is no longer available.", frameworkName ?: @"unknown"];
         return;
     }
 
     NSString *displayName = descriptor[@"displayName"] ?: frameworkName;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults setObject:frameworkName forKey:LCTVSelectedGuestNextLaunchKey];
-    NSString *message = [NSString stringWithFormat:@"%@ ARMED. Force-close LiveContainerTV, then reopen it. One guest runs per process.", displayName];
+    NSString *message = [NSString stringWithFormat:@"%@ ARMED from writable store. Force-close LiveContainerTV, then reopen it.", displayName];
     [defaults setObject:message forKey:LCTVLastMVP7ResultKey];
     [defaults synchronize];
     self.statusLabel.text = message;
@@ -449,25 +540,31 @@ static UIView *LCTVGuestCard(NSDictionary<NSString *, NSString *> *descriptor, i
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-        NSString *frameworkName = [defaults stringForKey:LCTVSelectedGuestNextLaunchKey];
 
+        NSString *seedError = nil;
+        if (!LCTVEnsureWritableGuestStore(&seedError)) {
+            LCTVStoreResult(defaults,
+                            [NSString stringWithFormat:@"FAIL MVP7B writable guest store setup: %@", seedError ?: @"unknown error"]);
+        }
+
+        NSString *frameworkName = [defaults stringForKey:LCTVSelectedGuestNextLaunchKey];
         if (frameworkName.length) {
             [defaults removeObjectForKey:LCTVSelectedGuestNextLaunchKey];
             NSDictionary<NSString *, NSString *> *descriptor = LCTVDescriptorForFrameworkName(frameworkName);
             NSString *displayName = descriptor[@"displayName"] ?: frameworkName;
             LCTVStoreResult(defaults,
-                            [NSString stringWithFormat:@"MVP7 %@ STARTED: loader entered before host UIApplicationMain", displayName]);
+                            [NSString stringWithFormat:@"MVP7B %@ STARTED: writable-store loader entered before host UIApplicationMain", displayName]);
 
             if (descriptor) {
                 NSString *bootError = nil;
                 int guestResult = LCTVBootGuestColdStart(argc, argv, descriptor, defaults, &bootError);
                 if (guestResult != INT_MIN) return guestResult;
 
-                NSString *failure = [NSString stringWithFormat:@"FAIL MVP7 %@ cold-start: %@", displayName, bootError ?: @"unknown error"];
+                NSString *failure = [NSString stringWithFormat:@"FAIL MVP7B %@ cold-start: %@", displayName, bootError ?: @"unknown error"];
                 LCTVStoreResult(defaults, failure);
             } else {
                 LCTVStoreResult(defaults,
-                                [NSString stringWithFormat:@"FAIL MVP7: selected guest bundle %@ was not discovered", frameworkName]);
+                                [NSString stringWithFormat:@"FAIL MVP7B: selected writable guest bundle %@ was not discovered", frameworkName]);
             }
         }
 
