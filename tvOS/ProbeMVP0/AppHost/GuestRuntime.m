@@ -20,6 +20,16 @@ static NSString *gLCTVHostGuestHome = nil;
 static int (*gLCTVOriginalNSGetExecutablePath)(char *, uint32_t *) = NULL;
 static NSString *(*gLCTVOriginalNSHomeDirectory)(void) = NULL;
 
+static NSString *LCTVExistingStatus(void) {
+    const char *value = getenv("LCTV_HOST_RUNTIME_STATUS");
+    return value ? ([NSString stringWithUTF8String:value] ?: @"") : @"";
+}
+
+static void LCTVStoreStatus(NSArray<NSString *> *parts) {
+    NSString *status = [parts componentsJoinedByString:@"; "];
+    setenv("LCTV_HOST_RUNTIME_STATUS", status.UTF8String, 1);
+}
+
 static BOOL LCTVMakeWritable(void *address, NSString **errorOut) {
     vm_size_t pageSize = (vm_size_t)vm_page_size;
     vm_address_t page = (vm_address_t)((uintptr_t)address & ~((uintptr_t)pageSize - 1));
@@ -268,14 +278,13 @@ static NSString *LCTVHostNSHomeDirectoryOverride(void) {
     return gLCTVOriginalNSHomeDirectory ? gLCTVOriginalNSHomeDirectory() : @"/";
 }
 
-BOOL LCTVApplyHostGuestIdentity(const struct mach_header_64 *guestHeader,
-                                NSString *guestBundlePath,
-                                NSString *guestExecutablePath,
-                                NSString *guestBundleIdentifier,
-                                NSString *guestProcessName,
-                                NSString *guestHomePath,
-                                NSString **errorOut) {
-    if (!guestHeader || !guestBundlePath.length || !guestExecutablePath.length ||
+BOOL LCTVPrepareHostGuestIdentityBeforeLoad(NSString *guestBundlePath,
+                                            NSString *guestExecutablePath,
+                                            NSString *guestBundleIdentifier,
+                                            NSString *guestProcessName,
+                                            NSString *guestHomePath,
+                                            NSString **errorOut) {
+    if (!guestBundlePath.length || !guestExecutablePath.length ||
         !guestBundleIdentifier.length || !guestProcessName.length || !guestHomePath.length) {
         if (errorOut) *errorOut = @"host guest identity context is incomplete";
         return NO;
@@ -300,12 +309,21 @@ BOOL LCTVApplyHostGuestIdentity(const struct mach_header_64 *guestHeader,
     BOOL ok = YES;
 
     gLCTVHostGuestHome = [guestHomePath copy];
+    free(gLCTVHostGuestExecutable);
+    gLCTVHostGuestExecutable = strdup(guestExecutablePath.fileSystemRepresentation);
+    if (!gLCTVHostGuestExecutable) {
+        ok = NO;
+        [status addObject:@"executable strdup failed"];
+    } else {
+        [status addObject:@"executable context prepared"];
+    }
+
     if (setenv("HOME", guestHomePath.fileSystemRepresentation, 1) != 0 ||
         setenv("CFFIXED_USER_HOME", guestHomePath.fileSystemRepresentation, 1) != 0) {
         ok = NO;
         [status addObject:@"HOME env failed"];
     } else {
-        [status addObject:@"HOME env installed"];
+        [status addObject:@"HOME env installed pre-dlopen"];
     }
 
     NSProcessInfo.processInfo.processName = guestProcessName;
@@ -315,14 +333,14 @@ BOOL LCTVApplyHostGuestIdentity(const struct mach_header_64 *guestHeader,
         const char **slot = getProgname();
         if (slot) *slot = strdup(guestProcessName.UTF8String);
     }
-    [status addObject:@"processName installed"];
+    [status addObject:@"processName installed pre-dlopen"];
 
     NSString *stepError = nil;
     if (!LCTVInstallNSBundleOverride(guestBundle, guestBundleIdentifier, &stepError)) {
         ok = NO;
         [status addObject:[NSString stringWithFormat:@"NSBundle failed: %@", stepError ?: @"unknown"]];
     } else {
-        [status addObject:@"NSBundle installed"];
+        [status addObject:@"NSBundle installed pre-dlopen"];
     }
 
     stepError = nil;
@@ -330,18 +348,34 @@ BOOL LCTVApplyHostGuestIdentity(const struct mach_header_64 *guestHeader,
         ok = NO;
         [status addObject:[NSString stringWithFormat:@"CFBundle failed: %@", stepError ?: @"unknown"]];
     } else {
-        [status addObject:@"CFBundle installed"];
+        [status addObject:@"CFBundle installed pre-dlopen"];
     }
 
-    free(gLCTVHostGuestExecutable);
-    gLCTVHostGuestExecutable = strdup(guestExecutablePath.fileSystemRepresentation);
+    LCTVStoreStatus(status);
+    NSString *statusText = [status componentsJoinedByString:@"; "];
+    if (errorOut) *errorOut = ok ? nil : statusText;
+    return ok;
+}
+
+BOOL LCTVFinishHostGuestIdentityAfterLoad(const struct mach_header_64 *guestHeader,
+                                          NSString **errorOut) {
+    if (!guestHeader || guestHeader->magic != MH_MAGIC_64) {
+        if (errorOut) *errorOut = @"loaded guest header is unavailable";
+        return NO;
+    }
+
+    NSMutableArray<NSString *> *status = [NSMutableArray array];
+    NSString *existing = LCTVExistingStatus();
+    if (existing.length) [status addObject:existing];
+    BOOL ok = YES;
+
     if (!gLCTVHostGuestExecutable) {
         ok = NO;
-        [status addObject:@"executable strdup failed"];
+        [status addObject:@"_NSGetExecutablePath failed: executable context missing"];
     } else {
         void *original = NULL;
         NSUInteger count = 0;
-        stepError = nil;
+        NSString *stepError = nil;
         if (!LCTVRebindGuestImport(guestHeader,
                                    "_NSGetExecutablePath",
                                    (void *)&LCTVHostExecutablePathOverride,
@@ -354,30 +388,58 @@ BOOL LCTVApplyHostGuestIdentity(const struct mach_header_64 *guestHeader,
             if (!gLCTVOriginalNSGetExecutablePath && original) {
                 gLCTVOriginalNSGetExecutablePath = (int (*)(char *, uint32_t *))original;
             }
-            [status addObject:[NSString stringWithFormat:@"_NSGetExecutablePath installed (%lu)", (unsigned long)count]];
+            [status addObject:[NSString stringWithFormat:@"_NSGetExecutablePath installed post-dlopen (%lu)", (unsigned long)count]];
         }
     }
 
     void *originalHome = NULL;
     NSUInteger homeCount = 0;
-    stepError = nil;
+    NSString *homeError = nil;
     if (!LCTVRebindGuestImport(guestHeader,
                                "NSHomeDirectory",
                                (void *)&LCTVHostNSHomeDirectoryOverride,
                                &originalHome,
                                &homeCount,
-                               &stepError)) {
+                               &homeError)) {
         ok = NO;
-        [status addObject:[NSString stringWithFormat:@"NSHomeDirectory failed: %@", stepError ?: @"unknown"]];
+        [status addObject:[NSString stringWithFormat:@"NSHomeDirectory failed: %@", homeError ?: @"unknown"]];
     } else {
         if (!gLCTVOriginalNSHomeDirectory && originalHome) {
             gLCTVOriginalNSHomeDirectory = (NSString *(*)(void))originalHome;
         }
-        [status addObject:[NSString stringWithFormat:@"NSHomeDirectory installed (%lu)", (unsigned long)homeCount]];
+        [status addObject:[NSString stringWithFormat:@"NSHomeDirectory installed post-dlopen (%lu)", (unsigned long)homeCount]];
     }
 
+    LCTVStoreStatus(status);
     NSString *statusText = [status componentsJoinedByString:@"; "];
-    setenv("LCTV_HOST_RUNTIME_STATUS", statusText.UTF8String, 1);
     if (errorOut) *errorOut = ok ? nil : statusText;
+    return ok;
+}
+
+BOOL LCTVApplyHostGuestIdentity(const struct mach_header_64 *guestHeader,
+                                NSString *guestBundlePath,
+                                NSString *guestExecutablePath,
+                                NSString *guestBundleIdentifier,
+                                NSString *guestProcessName,
+                                NSString *guestHomePath,
+                                NSString **errorOut) {
+    NSString *preError = nil;
+    BOOL preOK = LCTVPrepareHostGuestIdentityBeforeLoad(guestBundlePath,
+                                                        guestExecutablePath,
+                                                        guestBundleIdentifier,
+                                                        guestProcessName,
+                                                        guestHomePath,
+                                                        &preError);
+    NSString *postError = nil;
+    BOOL postOK = LCTVFinishHostGuestIdentityAfterLoad(guestHeader, &postError);
+    BOOL ok = preOK && postOK;
+    if (!ok && errorOut) {
+        NSMutableArray<NSString *> *errors = [NSMutableArray array];
+        if (preError.length) [errors addObject:preError];
+        if (postError.length) [errors addObject:postError];
+        *errorOut = [errors componentsJoinedByString:@" | "];
+    } else if (errorOut) {
+        *errorOut = nil;
+    }
     return ok;
 }
