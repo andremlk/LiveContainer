@@ -60,6 +60,14 @@ def patch_rpath(data: bytearray, command_offset: int, cmdsize: int) -> bool:
     if not raw.startswith(old):
         return False
     replacement = new + raw[len(old):]
+
+    # Some apps already carry both @executable_path/Frameworks and
+    # @loader_path/Frameworks. Rewriting the former would produce two
+    # identical LC_RPATH entries, and dyld rejects duplicate rpaths.
+    commands_end = HEADER_SIZE + u32(data, 20)
+    if replacement + b"\0" in bytes(data[HEADER_SIZE:commands_end]):
+        return False
+
     capacity = end_limit - start
     if len(replacement) + 1 > capacity:
         raise PatchError("retargeted LC_RPATH does not fit existing command")
