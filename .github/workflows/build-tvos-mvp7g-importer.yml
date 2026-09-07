@@ -1,0 +1,219 @@
+name: MVP7G Generic IPA Importer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp0]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7GMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/Tools/**'
+      - 'tvOS/ProbeMVP0/project.yml'
+      - '.github/workflows/build-tvos-mvp7g-importer.yml'
+
+concurrency:
+  group: tvos-mvp7g-importer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generic-importer:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build LiveContainerTV Mach-O patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          mkdir -p build-tools out
+          xcrun clang -std=c11 -Wall -Wextra -Werror \
+            Tools/lctv_macho_patch.c \
+            -o build-tools/lctv_macho_patch
+
+      - name: Build pinned Sample Guide IPA
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/lctv-mvp7g-sample
+          git clone --quiet https://github.com/abdulkarimkhaan/tvOS-sample-guide.git /tmp/lctv-mvp7g-sample
+          cd /tmp/lctv-mvp7g-sample
+          git checkout --quiet e1a672c59e2d3045542e351d326aa7642c4fa895
+
+          OUT="$GITHUB_WORKSPACE/tvOS/ProbeMVP0/out"
+          xcodebuild \
+            -project tvOS-Sample-Guide.xcodeproj \
+            -scheme tvOS-Sample-Guide \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$OUT/mvp7g-sample-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee "$OUT/mvp7g-sample-xcodebuild.log"
+
+          PRODUCTS="$OUT/mvp7g-sample-derived/Build/Products/Release-appletvos"
+          APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          test -n "$APP"
+          rm -rf "$OUT/mvp7g-sample-ipa"
+          mkdir -p "$OUT/mvp7g-sample-ipa/Payload"
+          cp -R "$APP" "$OUT/mvp7g-sample-ipa/Payload/"
+          (cd "$OUT/mvp7g-sample-ipa" && zip -qry ../MVP7G-Sample-Guide.ipa Payload)
+          test -f "$OUT/MVP7G-Sample-Guide.ipa"
+
+      - name: Download pinned NuvioTV unsigned IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          NUVIO='out/NuvioTV-3.3.3-unsigned-release.ipa'
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$NUVIO" \
+            'https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa'
+          echo '80d6f9b4fbd29b20bdbea71e493a782c9bd1a38ca5541a11940666054118eee1  out/NuvioTV-3.3.3-unsigned-release.ipa' | shasum -a 256 -c -
+
+      - name: Import two IPAs through one generic pipeline
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          IMPORT_ROOT='out/mvp7g-imports'
+          rm -rf "$IMPORT_ROOT"
+          export LCTV_PATCHER="$PWD/build-tools/lctv_macho_patch"
+
+          python3 Tools/lctv_import_guest.py \
+            out/MVP7G-Sample-Guide.ipa \
+            "$IMPORT_ROOT" | tee out/MVP7G-Import-Sample.txt
+
+          python3 Tools/lctv_import_guest.py \
+            out/NuvioTV-3.3.3-unsigned-release.ipa \
+            "$IMPORT_ROOT" | tee out/MVP7G-Import-Nuvio.txt
+
+      - name: Verify generic importer output
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee out/MVP7G-Import-Verification.txt
+          import json, plistlib
+          from pathlib import Path
+
+          root = Path('out/mvp7g-imports')
+          catalog = json.loads((root / 'LCTVImportCatalog.json').read_text())
+          guests = catalog['guests']
+          assert catalog['format'] == 1, catalog
+          assert len(guests) == 2, guests
+          ids = {g['bundleID'] for g in guests}
+          assert ids == {'com.pyksel.nuviotvos', 'com.abdul.tvOS-Sample-Guide'}, ids
+
+          for guest in guests:
+              slot = root / guest['codeSlot']
+              seed = root / guest['resourceSeed']
+              slot_info = plistlib.loads((slot / 'Info.plist').read_bytes())
+              seed_info = plistlib.loads((seed / 'Info.plist').read_bytes())
+              exe = guest['executable']
+              assert slot_info['LCTVCodeSlot'] is True
+              assert slot_info['LCTVImporterFormat'] == 1
+              assert seed_info['LCTVResourceSeed'] is True
+              assert seed_info['LCTVImporterFormat'] == 1
+              assert slot_info['LCTVImportFingerprint'] == seed_info['LCTVImportFingerprint']
+              assert (slot / exe).is_file(), (slot, exe)
+              assert not (seed / exe).exists(), (seed, exe)
+              assert not (seed / 'Frameworks').exists(), seed
+              assert not list(seed.glob('*.dylib')), seed
+              frameworks = len(list((slot / 'Frameworks').glob('*.framework'))) if (slot / 'Frameworks').is_dir() else 0
+              assert frameworks == guest['nestedFrameworks'], (frameworks, guest)
+              if guest['bundleID'] == 'com.pyksel.nuviotvos':
+                  assert frameworks == 36, frameworks
+              if guest['bundleID'] == 'com.abdul.tvOS-Sample-Guide':
+                  assert frameworks == 0, frameworks
+              print(guest['displayName'], guest['bundleID'], 'frameworks=', frameworks, 'fingerprint=', guest['fingerprint'][:12])
+
+          print('MVP7G GENERIC IMPORTER PASS: 2 arbitrary IPA inputs -> code slots + resource seeds')
+          PY
+
+      - name: Build MVP7G host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild \
+            -project LiveContainerTV.xcodeproj \
+            -scheme LiveContainerTVMVP7G \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7g-host \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out/mvp7g-host-xcodebuild.log
+
+      - name: Verify importer host source contract
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          grep -q 'Library/Caches/LiveContainerTV/ImportLibrary' AppHost/MVP7GMain.m
+          grep -q 'LCTVCodeSlot' AppHost/MVP7GMain.m
+          grep -q 'LCTVImportFingerprint' AppHost/MVP7GMain.m
+          grep -q 'LCTVResourceSeed' AppHost/MVP7GMain.m
+          grep -q 'LCTVDiscoverImportedSlots' AppHost/MVP7GMain.m
+          grep -q 'writable code=NO' AppHost/MVP7GMain.m
+          ! grep -q 'ExpectedNuvioBundleID' AppHost/MVP7GMain.m
+          echo 'MVP7G IMPORT HOST SOURCE PASS'
+
+      - name: Stage imported slots and seeds into host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7g-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          IMPORT_ROOT='out/mvp7g-imports'
+          test -d "$HOST"
+          mkdir -p "$HOST/Frameworks" "$HOST/GuestSeeds"
+          cp -R "$IMPORT_ROOT"/CodeSlots/*.framework "$HOST/Frameworks/"
+          cp -R "$IMPORT_ROOT"/ResourceSeeds/*.lctvseed "$HOST/GuestSeeds/"
+          cp "$IMPORT_ROOT/LCTVImportCatalog.json" "$HOST/LCTVImportCatalog.json"
+
+          python3 - <<'PY' | tee out/MVP7G-Staging.txt
+          import json, plistlib, subprocess
+          from pathlib import Path
+
+          host = Path('build-mvp7g-host/Build/Products/Release-appletvos/LiveContainerTV.app')
+          catalog = json.loads((host / 'LCTVImportCatalog.json').read_text())
+          assert len(catalog['guests']) == 2
+          for guest in catalog['guests']:
+              slot = host / 'Frameworks' / Path(guest['codeSlot']).name
+              seed = host / 'GuestSeeds' / Path(guest['resourceSeed']).name
+              info = plistlib.loads((slot / 'Info.plist').read_bytes())
+              exe = info['CFBundleExecutable']
+              subprocess.run(['python3', 'Tools/verify_macho.py', str(slot / exe)], check=True)
+              assert seed.is_dir(), seed
+              assert not (seed / exe).exists(), (seed, exe)
+              assert not (seed / 'Frameworks').exists(), seed
+              print(guest['bundleID'], slot.name, seed.name)
+          print('MVP7G STAGING PASS: generic imported code/resources paired')
+          PY
+
+      - name: Package MVP7G importer IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          HOST='build-mvp7g-host/Build/Products/Release-appletvos/LiveContainerTV.app'
+          rm -rf out/mvp7g-host-ipa
+          mkdir -p out/mvp7g-host-ipa/Payload
+          cp -R "$HOST" out/mvp7g-host-ipa/Payload/
+          (cd out/mvp7g-host-ipa && zip -qry ../LiveContainerTV-MVP7G-GenericImporter.ipa Payload)
+          test -f out/LiveContainerTV-MVP7G-GenericImporter.ipa
+          shasum -a 256 out/LiveContainerTV-MVP7G-GenericImporter.ipa | tee out/MVP7G-IPA-SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MVP7G-Generic-IPA-Importer
+          path: |
+            tvOS/ProbeMVP0/out/LiveContainerTV-MVP7G-GenericImporter.ipa
+            tvOS/ProbeMVP0/out/MVP7G-IPA-SHA256.txt
+            tvOS/ProbeMVP0/out/MVP7G-Import-Sample.txt
+            tvOS/ProbeMVP0/out/MVP7G-Import-Nuvio.txt
+            tvOS/ProbeMVP0/out/MVP7G-Import-Verification.txt
+            tvOS/ProbeMVP0/out/MVP7G-Staging.txt
+            tvOS/ProbeMVP0/out/mvp7g-imports/LCTVImportCatalog.json
+            tvOS/ProbeMVP0/out/mvp7g-imports/Manifests/*.json
+            tvOS/ProbeMVP0/out/mvp7g-host-xcodebuild.log
