@@ -1,4 +1,4 @@
-# LiveContainerTV MVP7I Termux companion
+# LiveContainerTV Termux companion
 # Copy to: ~/.config/livecontainertv/termux.conf
 #
 # IMPORTANT: LCTV_CUSTOM_IDENTIFIER must be exactly the same outer bundle ID
@@ -6,12 +6,20 @@
 # separate container and therefore does not preserve the existing app sandbox.
 
 LCTV_ATV_IP='192.168.x.x'
-LCTV_CUSTOM_IDENTIFIER='your.existing.livecontainertv.bundle.id'
+LCTV_CUSTOM_IDENTIFIER='dev.andre.livecontainertv.mvp3'
 LCTV_CUSTOM_NAME='LiveContainerTV'
 LCTV_PROOT_DISTRO='atvloadly'
 
-# Normally these can be auto-detected when exactly one pairing file exists in
-# /data/PlumeImpactor/pairing_files inside the atvloadly proot. Set them only if
-# you have multiple paired devices/files.
+# PlumeSign install pairing. Normally these can be auto-detected when exactly
+# one pairing file exists in /data/PlumeImpactor/pairing_files inside proot.
+# Set them only if you have multiple paired devices/files.
 # LCTV_UDID='...'
 # LCTV_PAIRING_FILE='/data/PlumeImpactor/pairing_files/<UDID>.plist'
+
+# JIT/debug attach. pymobiledevice3 is installed inside the proot.
+LCTV_PYMOBILE_PYTHON='/opt/lctv-pymobile/bin/python'
+
+# Optional. Leave unset when only one Apple TV has a saved RemotePairing record;
+# `lctv jit` will auto-select it. If several are paired, set the RemotePairing
+# identifier shown by `pymobiledevice3 remote browse --no-native`.
+# LCTV_REMOTE_PAIRING_ID='...'
