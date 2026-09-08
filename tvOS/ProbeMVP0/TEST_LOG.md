@@ -341,3 +341,78 @@ These results are treated as closed unless a future OS/JIT change explicitly giv
 ## Logging rule
 
 Every hardware result, regression, architectural conclusion, and workaround discovered from this point forward should be appended to this file in the same change set as the relevant code whenever practical.
+
+## 2026-09-07/08 — JIT + MVP8 Infuse diagnostic continuation
+
+### RemotePairing / JIT hardware validation
+
+- Persistent Wi-Fi RemotePairing established directly from Termux/pymobiledevice3 to Apple TV.
+- Plain `developer dvt` / `--userspace` attempted `usbmuxd` first and failed on Android/PRoot. Working path bypasses that initial probe and opens `RemotePairingTunnelService` directly.
+- DVT process lookup + `com.apple.internal.dt.remote.debugproxy` raw RSP attach/detach — PASS on hardware.
+- After attach/detach, host reports `CS_DEBUGGED=YES`.
+- MVP7J executable-memory probe (`RW -> RX`, arm64 `mov w0,#42; ret`) returned `42` — PASS on hardware.
+- `lctv jit launch` relaunches the host suspended before `main`, attaches debugserver, detaches, and then lets the process continue — PASS on hardware.
+- MVP8 verified `HOST_MAIN_ENTER debugged=YES` and `HOST_UI_BOOT debugged=YES` when launched through `lctv jit launch`.
+
+Conclusion: JIT/debug state is no longer hypothetical. The pre-main debug/JIT path is hardware proven on tvOS 18.6.
+
+### Infuse failure 3 — direct `@executable_path` dylib dependency
+
+After duplicate-`LC_RPATH` handling, Infuse reached a new dyld error:
+
+`@executable_path/Frameworks/InfuseBypass.framework/InfuseBypass`
+
+The framework was present inside the guest code slot, but `@executable_path` resolved against the outer LiveContainerTV executable, so dyld searched the wrong directory.
+
+Fix:
+
+- extend the portable Mach-O patcher beyond `LC_RPATH` handling
+- rewrite direct guest dylib dependencies from `@executable_path/...` to `@loader_path/...` where appropriate
+- preserve duplicate-RPATH avoidance separately
+
+Validation:
+
+- packaged guest contains `InfuseBypass.framework`
+- patched Infuse binary contains `@loader_path/Frameworks/InfuseBypass.framework/InfuseBypass`
+- old concrete `@executable_path/.../InfuseBypass` dependency is gone
+
+Hardware result: immediate `InfuseBypass` dlopen failure no longer occurs.
+
+### MVP8B — dlopen watchdog hardware result
+
+With the dependency rebase fix installed and launched through `lctv jit launch`:
+
+- process remains alive instead of exiting immediately
+- TV remains black while guest load is in progress
+- `dlopen()` does not return within 20 seconds
+- dyld image-add count reaches `150` and remains unchanged at 5 s, 10 s, and 20 s
+- last image reported by the dyld callback is `BackgroundTasks.framework/BackgroundTasks`
+
+Important interpretation:
+
+- `BackgroundTasks.framework` is only the last image announced by dyld; do **not** treat it as proven root cause.
+- Because `imagesAdded=150` is stable while `dlopen()` remains blocked, the current leading hypothesis is a constructor / Objective-C `+load` / Swift initializer / initialization-time wait after image mapping.
+- Repeating MVP8B without extra instrumentation is low-value; use stack sampling instead.
+
+### MVP8C — stack sampler CI lesson
+
+First MVP8C build attempt failed because tvOS SDK rejects `<mach/mach_vm.h>` and `mach_vm_read_overwrite` is unavailable there.
+
+Do not repeat:
+
+- importing `<mach/mach_vm.h>` for this tvOS target
+- using `mach_vm_read_overwrite` in the host diagnostic sampler
+
+Fix:
+
+- use supported `vm_read_overwrite` from the tvOS Mach headers instead
+- rebuild succeeded after this change
+
+MVP8C goal: while `dlopen()` is blocked, sample the main thread stack at watchdog checkpoints so the next hardware run can identify the actual blocking function/framework instead of guessing from the last dyld image.
+
+### Additional DO NOT REPEAT items from this phase
+
+- **Launching an armed guest by reopening the host normally:** too late for JIT. Use `lctv jit launch` so `CS_DEBUGGED=YES` exists before host `main`.
+- **Treating a successful JIT attach as proof that the guest boot succeeded:** JIT is only the prerequisite; guest loading must be traced separately.
+- **Treating the last dyld-added image as the culprit:** it is correlation only until the blocked thread stack identifies the wait site.
+- **Re-testing the old `InfuseBypass` missing-path failure after the direct dependency rebase fix is verified:** that failure is closed unless a regression reintroduces the old path.
