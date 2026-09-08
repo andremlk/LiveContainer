@@ -7,6 +7,7 @@ on:
     paths:
       - 'tvOS/ProbeMVP0/Termux/**'
       - 'tvOS/ProbeMVP0/Tools/lctv_jit_enable.py'
+      - 'tvOS/ProbeMVP0/Tools/lctv_macho_patch.py'
       - '.github/workflows/package-tvos-mvp8-termux-toolkit.yml'
 
 concurrency:
@@ -25,13 +26,91 @@ jobs:
           set -euo pipefail
           bash -n Termux/lctv
           bash -n Termux/lctv-rebase
-          python3 -m py_compile Tools/lctv_jit_enable.py
+          python3 -m py_compile Tools/lctv_jit_enable.py Tools/lctv_macho_patch.py
           grep -F 'lctv jit launch' Termux/lctv
           grep -F 'start_suspended=True' Tools/lctv_jit_enable.py
           grep -F 'dev.andre.livecontainertv.mvp3' Tools/lctv_jit_enable.py
           grep -F 'com.apple.internal.dt.remote.debugproxy' Tools/lctv_jit_enable.py
           grep -F 'vAttach;' Tools/lctv_jit_enable.py
           grep -F 'LCTV JIT: PASS' Tools/lctv_jit_enable.py
+          grep -F 'dylib dependencies rebased' Tools/lctv_macho_patch.py
+
+      - name: Synthetic Mach-O dependency rebase test
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          ROOT="$PWD/out/mvp8-macho-rebase-test"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT"
+
+          python3 - "$ROOT/guest" <<'PY'
+          import struct, sys
+          from pathlib import Path
+
+          out = Path(sys.argv[1])
+          MH_MAGIC_64 = 0xFEEDFACF
+          CPU_TYPE_ARM64 = 0x0100000C
+          MH_EXECUTE = 0x2
+          LC_SEGMENT_64 = 0x19
+          LC_LOAD_DYLINKER = 0xE
+          LC_MAIN = 0x80000028
+          LC_LOAD_DYLIB = 0xC
+
+          def align8(n):
+              return (n + 7) & ~7
+
+          commands = []
+
+          seg = bytearray(72)
+          struct.pack_into('<II', seg, 0, LC_SEGMENT_64, 72)
+          seg[8:18] = b'__PAGEZERO'
+          struct.pack_into('<QQ', seg, 24, 0, 0x100000000)
+          commands.append(bytes(seg))
+
+          dyld_name = b'/usr/lib/dyld\0'
+          dyld_size = align8(12 + len(dyld_name))
+          dyld = bytearray(dyld_size)
+          struct.pack_into('<III', dyld, 0, LC_LOAD_DYLINKER, dyld_size, 12)
+          dyld[12:12+len(dyld_name)] = dyld_name
+          commands.append(bytes(dyld))
+
+          main = bytearray(24)
+          struct.pack_into('<IIQQ', main, 0, LC_MAIN, 24, 0x1000, 0)
+          commands.append(bytes(main))
+
+          dep_name = b'@executable_path/Frameworks/InfuseBypass.framework/InfuseBypass\0'
+          dep_size = align8(24 + len(dep_name))
+          dep = bytearray(dep_size)
+          struct.pack_into('<IIIIII', dep, 0, LC_LOAD_DYLIB, dep_size, 24, 2, 0x10000, 0x10000)
+          dep[24:24+len(dep_name)] = dep_name
+          commands.append(bytes(dep))
+
+          blob = b''.join(commands)
+          header = struct.pack(
+              '<IiiIIIII',
+              MH_MAGIC_64,
+              CPU_TYPE_ARM64,
+              0,
+              MH_EXECUTE,
+              len(commands),
+              len(blob),
+              0x00200000,
+              0,
+          )
+          out.write_bytes(header + blob + b'\0' * 4096)
+          PY
+
+          python3 Tools/lctv_macho_patch.py "$ROOT/guest" | tee "$ROOT/patch.log"
+          grep -F 'dylibs=1' "$ROOT/patch.log"
+
+          python3 - "$ROOT/guest" <<'PY'
+          import sys
+          from pathlib import Path
+          data = Path(sys.argv[1]).read_bytes()
+          assert b'@loader_path/Frameworks/InfuseBypass.framework/InfuseBypass\0' in data
+          assert b'@executable_path/Frameworks/InfuseBypass.framework/InfuseBypass\0' not in data
+          print('MVP8 MACH-O DEPENDENCY REBASE PASS')
+          PY
 
       - name: Package toolkit
         working-directory: tvOS/ProbeMVP0
@@ -89,6 +168,10 @@ jobs:
             4. DVT relaunches the host suspended, debugserver attaches before main,
                then detach resumes the process with CS_DEBUGGED already established.
 
+          Guest Mach-O preparation also rebases direct dylib dependencies from
+          @executable_path to @loader_path so frameworks resolve inside the signed
+          code-slot root instead of the outer LiveContainerTV executable directory.
+
           The helper uses the saved RemotePairing record directly and a no-root
           userspace RSD tunnel. If more than one Apple TV is paired, set
           LCTV_REMOTE_PAIRING_ID in ~/.config/livecontainertv/termux.conf.
@@ -104,4 +187,5 @@ jobs:
           path: |
             tvOS/ProbeMVP0/out/MVP8-Termux-JIT-Toolkit.zip
             tvOS/ProbeMVP0/out/MVP8-Termux-JIT-Toolkit-SHA256.txt
+            tvOS/ProbeMVP0/out/mvp8-macho-rebase-test/patch.log
           if-no-files-found: error
