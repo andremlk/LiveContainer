@@ -1,4 +1,4 @@
-name: MVP8D Cross-Thread Dlopen Sampler
+name: MVP8E Deep Deadlock Pair Sampler
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build | tee out-mvp8/xcodebuild.log
 
-      - name: Verify MVP8D trace binary
+      - name: Verify MVP8E trace binary
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
@@ -62,18 +62,16 @@ jobs:
           file "$BIN"
           lipo -info "$BIN" | tee out-mvp8/lipo.txt
           nm "$BIN" | grep -E 'LCTVMVP8TraceEvent|LCTVMVP7HOriginalMain|LCTVMVP8Dlopen' | tee out-mvp8/trace-symbols.txt
-          grep -F 'DLOPEN_ENTER' AppHost/MVP8Main.m
-          grep -F 'DLOPEN_STILL_RUNNING' AppHost/MVP8Main.m
-          grep -F 'DLOPEN_LAST_IMAGE' AppHost/MVP8Main.m
-          grep -F 'DLOPEN_MAIN_STACK' AppHost/MVP8Main.m
-          grep -F 'THREAD_SCAN' AppHost/MVP8Main.m
-          grep -F 'THREAD_CAND' AppHost/MVP8Main.m
+          grep -F 'DLOPEN_HANG' AppHost/MVP8Main.m
+          grep -F 'DEADLOCK_MAIN' AppHost/MVP8Main.m
+          grep -F 'DEADLOCK_SCAN' AppHost/MVP8Main.m
+          grep -F 'DEADLOCK_PEER' AppHost/MVP8Main.m
           grep -F 'DLOPEN_RETURN' AppHost/MVP8Main.m
           grep -F 'LEGACY_STAGE:' AppHost/MVP8Trace.m
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee out-mvp8/bundle-id.txt
           /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" | tee out-mvp8/executable.txt
 
-      - name: Package MVP8D host template IPA
+      - name: Package MVP8E host template IPA
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
@@ -82,15 +80,15 @@ jobs:
           rm -rf out-mvp8/package
           mkdir -p "$PKG"
           cp -R "$APP" "$PKG/"
-          (cd out-mvp8/package && zip -qry ../LiveContainerTV-MVP8D-CrossThreadSampler.ipa Payload)
-          shasum -a 256 out-mvp8/LiveContainerTV-MVP8D-CrossThreadSampler.ipa | tee out-mvp8/SHA256.txt
+          (cd out-mvp8/package && zip -qry ../LiveContainerTV-MVP8E-DeepDeadlockSampler.ipa Payload)
+          shasum -a 256 out-mvp8/LiveContainerTV-MVP8E-DeepDeadlockSampler.ipa | tee out-mvp8/SHA256.txt
 
-      - name: Upload MVP8D host IPA
+      - name: Upload MVP8E host IPA
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainerTV-MVP8D-CrossThreadSampler
+          name: LiveContainerTV-MVP8E-DeepDeadlockSampler
           path: |
-            tvOS/ProbeMVP0/out-mvp8/LiveContainerTV-MVP8D-CrossThreadSampler.ipa
+            tvOS/ProbeMVP0/out-mvp8/LiveContainerTV-MVP8E-DeepDeadlockSampler.ipa
             tvOS/ProbeMVP0/out-mvp8/SHA256.txt
             tvOS/ProbeMVP0/out-mvp8/xcodebuild.log
             tvOS/ProbeMVP0/out-mvp8/trace-symbols.txt
