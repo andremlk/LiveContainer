@@ -20,6 +20,11 @@ LCTV_PROOT_DISTRO='atvloadly'
 LCTV_PYMOBILE_PYTHON='/opt/lctv-pymobile/bin/python'
 
 # Optional. Leave unset when only one Apple TV has a saved RemotePairing record;
-# `lctv jit` will auto-select it. If several are paired, set the RemotePairing
-# identifier shown by `pymobiledevice3 remote browse --no-native`.
+# `lctv jit` / `lctv jit launch` will auto-select it. If several are paired, set
+# the RemotePairing identifier shown by `pymobiledevice3 remote browse --no-native`.
 # LCTV_REMOTE_PAIRING_ID='...'
+
+# JIT commands:
+#   lctv jit         -> attach/detach the process that is already running.
+#   lctv jit launch  -> relaunch suspended, attach before main, detach/resume.
+#                       Use this after arming an MVP8 guest.
