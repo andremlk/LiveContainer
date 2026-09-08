@@ -25,7 +25,7 @@ need() {
 
 usage() {
   cat <<'EOF'
-LiveContainerTV MVP7I — Termux importer/install companion
+LiveContainerTV — Termux importer/install/JIT companion
 
 Uso:
   lctv doctor
@@ -33,11 +33,12 @@ Uso:
   lctv add <guest.ipa> [salida.ipa]
   lctv install [LiveContainerTV.ipa]
   lctv add-install <guest.ipa> [salida.ipa]
+  lctv jit
 
 Estado:
   ~/.local/share/livecontainertv/current.ipa
 
-Configuración opcional para instalar:
+Configuración:
   ~/.config/livecontainertv/termux.conf
 
 Variables requeridas para 'install':
@@ -49,6 +50,14 @@ Variables opcionales:
   LCTV_PROOT_DISTRO=atvloadly
   LCTV_UDID=<udid>
   LCTV_PAIRING_FILE=/data/PlumeImpactor/pairing_files/<udid>.plist
+
+Variables para 'jit':
+  LCTV_CUSTOM_IDENTIFIER=dev.andre.livecontainertv.mvp3
+  LCTV_PYMOBILE_PYTHON=/opt/lctv-pymobile/bin/python
+  LCTV_REMOTE_PAIRING_ID=<remote-pairing-id>  # opcional si solo hay un Apple TV emparejado
+
+'jit' habilita el estado debug/JIT del proceso LiveContainerTV que ya está
+abierto. Si la app se reinicia o se reinstala, hay que ejecutar 'lctv jit' otra vez.
 EOF
 }
 
@@ -96,6 +105,7 @@ cmd_doctor() {
     "$TOOLS/lctv_import_guest.py" \
     "$TOOLS/lctv_registry_from_host.py" \
     "$TOOLS/lctv_assemble_update.py" \
+    "$TOOLS/lctv_jit_enable.py" \
     "$TOOLS/verify_macho.py"; do
     if [ -f "$f" ]; then
       printf 'PASS file           %s\n' "$(basename "$f")"
@@ -114,7 +124,7 @@ cmd_doctor() {
     echo "Instala dependencias en Termux con: pkg install python zip unzip dnsutils proot-distro"
     return 1
   fi
-  echo "MVP7I DOCTOR PASS"
+  echo "LCTV DOCTOR PASS"
 }
 
 cmd_init() {
@@ -314,6 +324,40 @@ plumesign sign-rsd \
   echo 'MVP7I INSTALL PASS'
 }
 
+cmd_jit() {
+  [ "$#" -eq 0 ] || { usage; return 2; }
+  need proot-distro
+
+  local distro pymobile_python bundle remote_id helper
+  distro="${LCTV_PROOT_DISTRO:-atvloadly}"
+  pymobile_python="${LCTV_PYMOBILE_PYTHON:-/opt/lctv-pymobile/bin/python}"
+  bundle="${LCTV_CUSTOM_IDENTIFIER:-dev.andre.livecontainertv.mvp3}"
+  remote_id="${LCTV_REMOTE_PAIRING_ID:-}"
+  helper="$TOOLS/lctv_jit_enable.py"
+
+  [ -f "$helper" ] || {
+    echo "ERROR: falta helper JIT: $helper" >&2
+    return 1
+  }
+
+  echo "LCTV JIT: bundle=$bundle"
+  echo "LCTV JIT: proot=$distro"
+
+  proot-distro login "$distro" -- env \
+    -u ANDROID_DATA \
+    -u ANDROID_ROOT \
+    -u ANDROID_STORAGE \
+    -u ANDROID_I18N_ROOT \
+    -u ANDROID_TZDATA_ROOT \
+    -u ANDROID_ART_ROOT \
+    -u PREFIX \
+    HOME=/root \
+    XDG_CACHE_HOME=/root/.cache \
+    TMPDIR=/tmp \
+    PYTHONUNBUFFERED=1 \
+    "$pymobile_python" - "$bundle" "$remote_id" < "$helper"
+}
+
 cmd="${1:-}"
 case "$cmd" in
   doctor)
@@ -339,6 +383,10 @@ case "$cmd" in
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { usage; exit 2; }
     built="$(build_update "$@" | tee /dev/stderr | tail -n1)"
     install_ipa "$built"
+    ;;
+  jit)
+    shift
+    cmd_jit "$@"
     ;;
   -h|--help|help|'')
     usage
