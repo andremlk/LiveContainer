@@ -1,4 +1,4 @@
-name: MVP8B Dlopen Watchdog
+name: MVP8C Dlopen Stack Sampler
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build | tee out-mvp8/xcodebuild.log
 
-      - name: Verify MVP8B trace binary
+      - name: Verify MVP8C trace binary
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
@@ -65,12 +65,14 @@ jobs:
           grep -F 'DLOPEN_ENTER' AppHost/MVP8Main.m
           grep -F 'DLOPEN_STILL_RUNNING' AppHost/MVP8Main.m
           grep -F 'DLOPEN_LAST_IMAGE' AppHost/MVP8Main.m
+          grep -F 'DLOPEN_MAIN_STACK' AppHost/MVP8Main.m
+          grep -F 'STACK t=' AppHost/MVP8Main.m
           grep -F 'DLOPEN_RETURN' AppHost/MVP8Main.m
           grep -F 'LEGACY_STAGE:' AppHost/MVP8Trace.m
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee out-mvp8/bundle-id.txt
           /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" | tee out-mvp8/executable.txt
 
-      - name: Package MVP8B host template IPA
+      - name: Package MVP8C host template IPA
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
@@ -79,15 +81,15 @@ jobs:
           rm -rf out-mvp8/package
           mkdir -p "$PKG"
           cp -R "$APP" "$PKG/"
-          (cd out-mvp8/package && zip -qry ../LiveContainerTV-MVP8B-DlopenWatchdog.ipa Payload)
-          shasum -a 256 out-mvp8/LiveContainerTV-MVP8B-DlopenWatchdog.ipa | tee out-mvp8/SHA256.txt
+          (cd out-mvp8/package && zip -qry ../LiveContainerTV-MVP8C-DlopenStackSampler.ipa Payload)
+          shasum -a 256 out-mvp8/LiveContainerTV-MVP8C-DlopenStackSampler.ipa | tee out-mvp8/SHA256.txt
 
-      - name: Upload MVP8B host IPA
+      - name: Upload MVP8C host IPA
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainerTV-MVP8B-DlopenWatchdog
+          name: LiveContainerTV-MVP8C-DlopenStackSampler
           path: |
-            tvOS/ProbeMVP0/out-mvp8/LiveContainerTV-MVP8B-DlopenWatchdog.ipa
+            tvOS/ProbeMVP0/out-mvp8/LiveContainerTV-MVP8C-DlopenStackSampler.ipa
             tvOS/ProbeMVP0/out-mvp8/SHA256.txt
             tvOS/ProbeMVP0/out-mvp8/xcodebuild.log
             tvOS/ProbeMVP0/out-mvp8/trace-symbols.txt
