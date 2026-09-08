@@ -536,3 +536,41 @@ JIT helper safety fix:
 - print `SAFE CLEANUP` when automatic recovery succeeds.
 
 This prevents the same transient service failure from forcing another Apple TV reboot. A new MVP8F hardware attempt remains pending.
+
+### MVP8F — hardware attempt 2: debugproxy remains absent after reboot
+
+The Apple TV was rebooted and left fully awake at the tvOS home screen for five
+minutes.  A second safe `lctv jit launch` attempt reported:
+
+- userspace RemotePairing tunnel — PASS;
+- RSD product version (`tvOS 18.6`) — PASS;
+- debugserver preflight — FAIL: `debugproxy no está disponible`;
+- no application process was launched — PASS (safe failure);
+- LiveContainerTV remained closed at the home screen; no reboot was required.
+
+This rules out ordinary boot settling time and confirms that the black frame in
+attempt 1 was not an MVP8F/Infuse result.  The persistent failure matches a
+developer-image/service-catalog problem: RemotePairing and RSD are healthy, but
+the DDI-backed `com.apple.internal.dt.remote.debugproxy` entry is absent.
+
+Recovery added to the Termux toolkit:
+
+- `lctv jit repair` opens the already-proven RemotePairing-only userspace tunnel;
+- it does not query, kill, launch, suspend, attach to, or resume any application;
+- if debugproxy is absent, it calls pymobiledevice3 `auto_mount(rsd)` to mount the
+  personalized developer image used by tvOS 18;
+- it closes that pre-mount tunnel and opens a completely new tunnel, because the
+  RSD service catalog is negotiated when the connection starts;
+- it reports `REPAIR PASS` only if the new RSD catalog contains debugproxy.
+
+Hardware environment confirmed before adding the recovery:
+
+- pymobiledevice3 `11.9.2`;
+- `mounter auto-mount` supports RSD and userspace device-provider options;
+- plain `--userspace` remains unsuitable in this Android/proot environment
+  because its normal provider discovery probes unavailable usbmuxd first; the
+  repair mode reuses the existing RemotePairing-only override instead.
+
+Hardware validation of `lctv jit repair` is pending.  Do not classify the DDI
+mount as the final solution until `REPAIR PASS` and a subsequent pre-main
+`ATTACH OK` are both observed.

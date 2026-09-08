@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Enable the debug/JIT runtime state for LiveContainerTV over RemotePairing.
 
-Two modes are supported:
+Three modes are supported:
 
 * ``current`` attaches to the already-running host, then cleanly detaches.  This
   is the hardware-proven MVP7J flow that leaves CS_DEBUGGED set for that process.
@@ -9,6 +9,10 @@ Two modes are supported:
   before application main executes, then detaches.  This is required for MVP8:
   an armed guest starts from process main, so JIT must already be enabled before
   guest entry is reached.
+* ``repair`` never launches or attaches to an application.  It checks whether
+  the RSD debugproxy service is advertised, mounts the personalized developer
+  image when it is missing, then opens a fresh tunnel to verify the refreshed
+  service catalog.
 
 The helper is intentionally RemotePairing-only.  pymobiledevice3's no-root
 userspace tunnel normally probes CoreDeviceProxy through usbmuxd first; that
@@ -24,14 +28,16 @@ import asyncio
 import sys
 from typing import Optional
 
+from pymobiledevice3.exceptions import AlreadyMountedError
 from pymobiledevice3.remote import userspace_tunnel
 from pymobiledevice3.remote.tunnel_service import get_remote_pairing_tunnel_services
 from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
 from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
+from pymobiledevice3.services.mobile_image_mounter import auto_mount
 
 DEBUG_SERVICE = "com.apple.internal.dt.remote.debugproxy"
 DEFAULT_BUNDLE_ID = "dev.andre.livecontainertv.mvp3"
-VALID_MODES = {"current", "launch"}
+VALID_MODES = {"current", "launch", "repair"}
 
 
 class JITEnableError(RuntimeError):
@@ -174,18 +180,85 @@ async def _prepare_pid(rsd, bundle_id: str, mode: str) -> int:
     return pid
 
 
+def _new_tunnel(remote_pairing_id: Optional[str]):
+    return userspace_tunnel.UserspaceRsdTunnel(
+        serial=remote_pairing_id or None,
+        autopair=False,
+    )
+
+
+def _debug_port(rsd) -> int:
+    try:
+        return rsd.get_service_port(DEBUG_SERVICE)
+    except Exception as exc:
+        raise JITEnableError("debugproxy no está disponible") from exc
+
+
+async def _repair_developer_services(remote_pairing_id: Optional[str]) -> None:
+    """Mount the developer image without launching an application."""
+    tunnel = _new_tunnel(remote_pairing_id)
+    print("LCTV JIT: modo=repair", flush=True)
+    print("LCTV JIT: abriendo túnel userspace para diagnóstico...", flush=True)
+    rsd = await tunnel.aopen()
+    mount_requested = False
+    try:
+        print(f"LCTV JIT: tvOS {rsd.product_version}", flush=True)
+        try:
+            port = _debug_port(rsd)
+        except JITEnableError:
+            print("LCTV JIT: debugproxy ausente; montando imagen de desarrollo...", flush=True)
+            try:
+                await auto_mount(rsd)
+                mount_requested = True
+                print("LCTV JIT: imagen de desarrollo montada", flush=True)
+            except AlreadyMountedError:
+                mount_requested = True
+                print("LCTV JIT: imagen ya figuraba montada; renovando catálogo RSD", flush=True)
+            except Exception as exc:
+                raise JITEnableError(
+                    f"no se pudo montar la imagen de desarrollo: {type(exc).__name__}: {exc}"
+                ) from exc
+        else:
+            print(f"LCTV JIT: debugproxy disponible en {port}", flush=True)
+            print("LCTV JIT: REPAIR PASS — no fue necesario montar nada", flush=True)
+            return
+    finally:
+        await tunnel.aclose()
+
+    if not mount_requested:
+        raise JITEnableError("la recuperación no solicitó el montaje esperado")
+
+    # The RSD peer-info/service map is negotiated when the tunnel opens.  A
+    # tunnel created before the DDI mount cannot see newly added developer
+    # services, so verification must use a completely new tunnel.
+    print("LCTV JIT: reabriendo túnel para renovar servicios RSD...", flush=True)
+    verify_tunnel = _new_tunnel(remote_pairing_id)
+    verify_rsd = await verify_tunnel.aopen()
+    try:
+        port = _debug_port(verify_rsd)
+        print(f"LCTV JIT: debugproxy restaurado en {port}", flush=True)
+        print("LCTV JIT: REPAIR PASS — servicios de desarrollo disponibles", flush=True)
+    except JITEnableError as exc:
+        raise JITEnableError(
+            "la imagen fue procesada, pero debugproxy sigue ausente en un túnel nuevo"
+        ) from exc
+    finally:
+        await verify_tunnel.aclose()
+
+
 async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str], mode: str) -> None:
     if mode not in VALID_MODES:
-        raise JITEnableError(f"modo inválido {mode!r}; usa current o launch")
+        raise JITEnableError(f"modo inválido {mode!r}; usa current, launch o repair")
 
     # Hardware-tested workaround for Termux/proot: skip the usbmux/CoreDeviceProxy
     # probe and feed UserspaceRsdTunnel an already-connected RemotePairing service.
     userspace_tunnel._create_no_root_tunnel_provider = _remote_pairing_only
 
-    tunnel = userspace_tunnel.UserspaceRsdTunnel(
-        serial=remote_pairing_id or None,
-        autopair=False,
-    )
+    if mode == "repair":
+        await _repair_developer_services(remote_pairing_id)
+        return
+
+    tunnel = _new_tunnel(remote_pairing_id)
 
     service = None
     attached = False
@@ -205,11 +278,11 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str], mode: str
         # RSD service briefly disappeared once; doing this after launch left the
         # Apple TV showing the pre-main black frame until it was rebooted.
         try:
-            debug_port = rsd.get_service_port(DEBUG_SERVICE)
+            debug_port = _debug_port(rsd)
         except Exception as exc:
             raise JITEnableError(
                 "debugproxy no está disponible; no se lanzó ningún proceso. "
-                "Espera a que tvOS termine de iniciar y reintenta"
+                "Ejecuta 'lctv jit repair' y vuelve a intentarlo"
             ) from exc
         print(f"LCTV JIT: debugproxy preflight {debug_port}", flush=True)
 

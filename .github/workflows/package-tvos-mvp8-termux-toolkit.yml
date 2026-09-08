@@ -34,6 +34,9 @@ jobs:
           grep -F 'debugproxy preflight' Tools/lctv_jit_enable.py
           grep -F 'SAFE CLEANUP' Tools/lctv_jit_enable.py
           grep -F 'cleanup_process_control.kill(pid)' Tools/lctv_jit_enable.py
+          grep -F 'auto_mount(rsd)' Tools/lctv_jit_enable.py
+          grep -F 'REPAIR PASS' Tools/lctv_jit_enable.py
+          grep -F "lctv jit repair" Termux/lctv
           grep -F 'vAttach;' Tools/lctv_jit_enable.py
           grep -F 'LCTV JIT: PASS' Tools/lctv_jit_enable.py
           grep -F 'dylib dependencies rebased' Tools/lctv_macho_patch.py
@@ -170,6 +173,16 @@ jobs:
             3. Run: bin/lctv jit launch
             4. DVT relaunches the host suspended, debugserver attaches before main,
                then detach resumes the process with CS_DEBUGGED already established.
+
+          Developer-service recovery after a reboot:
+            1. Keep LiveContainerTV closed.
+            2. Run: bin/lctv jit repair
+            3. Expect: LCTV JIT: REPAIR PASS
+            4. Run: bin/lctv jit launch
+
+          Repair mode never launches or attaches to an application. It mounts
+          the personalized developer image only when debugproxy is absent and
+          verifies the refreshed service catalog through a new RSD tunnel.
 
           Safety behavior:
             - debugproxy is checked before a suspended launch is created.

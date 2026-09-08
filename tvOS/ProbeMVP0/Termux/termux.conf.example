@@ -28,3 +28,4 @@ LCTV_PYMOBILE_PYTHON='/opt/lctv-pymobile/bin/python'
 #   lctv jit         -> attach/detach the process that is already running.
 #   lctv jit launch  -> relaunch suspended, attach before main, detach/resume.
 #                       Use this after arming an MVP8 guest.
+#   lctv jit repair  -> mount/refresh developer services without launching an app.
