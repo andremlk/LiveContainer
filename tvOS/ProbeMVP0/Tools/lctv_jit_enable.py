@@ -191,6 +191,8 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str], mode: str
     attached = False
     reader = None
     writer = None
+    pid = 0
+    launch_released = False
 
     print(f"LCTV JIT: modo={mode}", flush=True)
     print("LCTV JIT: abriendo túnel userspace...", flush=True)
@@ -198,10 +200,22 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str], mode: str
 
     try:
         print(f"LCTV JIT: tvOS {rsd.product_version}", flush=True)
+
+        # Resolve debugproxy before creating a suspended process. On hardware the
+        # RSD service briefly disappeared once; doing this after launch left the
+        # Apple TV showing the pre-main black frame until it was rebooted.
+        try:
+            debug_port = rsd.get_service_port(DEBUG_SERVICE)
+        except Exception as exc:
+            raise JITEnableError(
+                "debugproxy no está disponible; no se lanzó ningún proceso. "
+                "Espera a que tvOS termine de iniciar y reintenta"
+            ) from exc
+        print(f"LCTV JIT: debugproxy preflight {debug_port}", flush=True)
+
         pid = await _prepare_pid(rsd, bundle_id, mode)
 
         print(f"LCTV JIT: PID {pid}", flush=True)
-        debug_port = rsd.get_service_port(DEBUG_SERVICE)
         print(f"LCTV JIT: debugproxy {debug_port}", flush=True)
 
         service = await rsd.start_lockdown_developer_service(DEBUG_SERVICE)
@@ -242,6 +256,8 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str], mode: str
         if detach_reply != "OK":
             raise JITEnableError(f"detach inesperado: {detach_reply}")
         attached = False
+        if mode == "launch":
+            launch_released = True
         print("LCTV JIT: DETACH OK", flush=True)
 
         await asyncio.sleep(0.35)
@@ -268,7 +284,9 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str], mode: str
     finally:
         if attached and reader is not None and writer is not None:
             try:
-                await _rsp(reader, writer, "D", timeout=5.0)
+                cleanup_reply = await _rsp(reader, writer, "D", timeout=5.0)
+                if cleanup_reply == "OK" and mode == "launch":
+                    launch_released = True
             except Exception:
                 pass
         if service is not None:
@@ -276,6 +294,22 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str], mode: str
                 await service.close()
             except Exception:
                 pass
+
+        # Never strand a pre-main suspended launch. If debugserver setup or
+        # attach/detach failed, kill that exact PID through DVT before closing
+        # the tunnel. The armed selection remains stored for the next attempt.
+        if mode == "launch" and pid > 0 and not launch_released:
+            try:
+                async with DvtProvider(rsd) as cleanup_dvt:
+                    async with ProcessControl(cleanup_dvt) as cleanup_process_control:
+                        await cleanup_process_control.kill(pid)
+                print(f"LCTV JIT: SAFE CLEANUP — PID {pid} suspendido eliminado", flush=True)
+            except Exception as cleanup_exc:
+                print(
+                    f"LCTV JIT: WARN — no se pudo eliminar PID suspendido {pid}: {cleanup_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         await tunnel.aclose()
 
 

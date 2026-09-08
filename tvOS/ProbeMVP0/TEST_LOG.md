@@ -508,3 +508,31 @@ DO NOT REPEAT:
 - moving guest `dlopen()` to a worker thread as a substitute for breaking the proven dyld/UIKit/BoardServices cycle;
 - leaving the libdyld vtable patched after guest `dlopen()` returns;
 - bypassing dyld locking globally or for threads other than the single guest-loading thread.
+
+### MVP8F — hardware attempt 1 blocked before guest execution
+
+The first MVP8F launch attempt did not exercise the no-lock loader.
+
+Observed `lctv jit launch` sequence:
+
+- userspace RemotePairing tunnel — PASS
+- DVT suspended launch — PASS (`PID 310`)
+- debugserver service lookup — FAIL: `No such service: com.apple.internal.dt.remote.debugproxy`
+- `ATTACH OK` was never reached
+- TV displayed a black frame because the host remained suspended before `main`
+
+Interpretation:
+
+- this is a JIT-launch infrastructure failure, not an MVP8F or Infuse runtime result;
+- neither the JIT gate nor `MVP8F_NOLOCK_BEGIN` executed;
+- the armed guest selection should remain available because host `main` did not run.
+
+JIT helper safety fix:
+
+- resolve the RSD `remote.debugproxy` port before killing/relaunching the host;
+- if the service is missing, fail without creating a suspended process;
+- track whether a suspended launch was successfully released by RSP detach;
+- on any post-launch attach/detach failure, kill that exact suspended PID through DVT before closing the tunnel;
+- print `SAFE CLEANUP` when automatic recovery succeeds.
+
+This prevents the same transient service failure from forcing another Apple TV reboot. A new MVP8F hardware attempt remains pending.

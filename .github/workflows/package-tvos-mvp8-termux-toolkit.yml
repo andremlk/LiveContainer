@@ -31,6 +31,9 @@ jobs:
           grep -F 'start_suspended=True' Tools/lctv_jit_enable.py
           grep -F 'dev.andre.livecontainertv.mvp3' Tools/lctv_jit_enable.py
           grep -F 'com.apple.internal.dt.remote.debugproxy' Tools/lctv_jit_enable.py
+          grep -F 'debugproxy preflight' Tools/lctv_jit_enable.py
+          grep -F 'SAFE CLEANUP' Tools/lctv_jit_enable.py
+          grep -F 'cleanup_process_control.kill(pid)' Tools/lctv_jit_enable.py
           grep -F 'vAttach;' Tools/lctv_jit_enable.py
           grep -F 'LCTV JIT: PASS' Tools/lctv_jit_enable.py
           grep -F 'dylib dependencies rebased' Tools/lctv_macho_patch.py
@@ -167,6 +170,11 @@ jobs:
             3. Run: bin/lctv jit launch
             4. DVT relaunches the host suspended, debugserver attaches before main,
                then detach resumes the process with CS_DEBUGGED already established.
+
+          Safety behavior:
+            - debugproxy is checked before a suspended launch is created.
+            - if attach/detach fails after launch, the helper kills the suspended
+              PID so the Apple TV is not left on a pre-main black screen.
 
           Guest Mach-O preparation also rebases direct dylib dependencies from
           @executable_path to @loader_path so frameworks resolve inside the signed
