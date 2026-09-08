@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Enable the debug/JIT runtime state for the currently running LiveContainerTV host.
+"""Enable the debug/JIT runtime state for LiveContainerTV over RemotePairing.
 
-This helper is intentionally RemotePairing-only.  The no-root userspace tunnel in
-pymobiledevice3 normally probes CoreDeviceProxy through usbmuxd first; that probe
-cannot work in our Android/Termux proot environment because there is no usbmuxd.
-Here we select an already-paired Apple TV directly through Bonjour RemotePairing,
-then let pymobiledevice3 build its normal userspace TCP tunnel and RSD stack.
+Two modes are supported:
 
-The debugserver RSP attach/detach sequence was validated on physical tvOS 18.6:
-attaching the LiveContainerTV process sets CS_DEBUGGED and the flag remains set
-after a clean detach, allowing the MVP7J executable-memory probe to pass.
+* ``current`` attaches to the already-running host, then cleanly detaches.  This
+  is the hardware-proven MVP7J flow that leaves CS_DEBUGGED set for that process.
+* ``launch`` asks DVT to kill/relaunch the host *suspended*, attaches debugserver
+  before application main executes, then detaches.  This is required for MVP8:
+  an armed guest starts from process main, so JIT must already be enabled before
+  guest entry is reached.
+
+The helper is intentionally RemotePairing-only.  pymobiledevice3's no-root
+userspace tunnel normally probes CoreDeviceProxy through usbmuxd first; that
+probe cannot work in our Android/Termux proot because there is no usbmuxd.  We
+therefore select an already-paired Apple TV directly through Bonjour
+RemotePairing, then let pymobiledevice3 build its normal userspace TCP tunnel and
+RSD stack.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from pymobiledevice3.services.dvt.instruments.process_control import ProcessCont
 
 DEBUG_SERVICE = "com.apple.internal.dt.remote.debugproxy"
 DEFAULT_BUNDLE_ID = "dev.andre.livecontainertv.mvp3"
+VALID_MODES = {"current", "launch"}
 
 
 class JITEnableError(RuntimeError):
@@ -141,7 +148,36 @@ async def _pid_for_bundle(rsd, bundle_id: str) -> int:
             return await process_control.process_identifier_for_bundle_identifier(bundle_id)
 
 
-async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str]) -> None:
+async def _prepare_pid(rsd, bundle_id: str, mode: str) -> int:
+    if mode == "current":
+        pid = await _pid_for_bundle(rsd, bundle_id)
+        if pid <= 0:
+            raise JITEnableError(
+                f"{bundle_id} no está ejecutándose; abre LiveContainerTV en el Apple TV y reintenta"
+            )
+        return pid
+
+    print("LCTV JIT: relanzando suspendido antes de main...", flush=True)
+    async with DvtProvider(rsd) as dvt:
+        async with ProcessControl(dvt) as process_control:
+            old_pid = await process_control.process_identifier_for_bundle_identifier(bundle_id)
+            if old_pid > 0:
+                print(f"LCTV JIT: proceso anterior PID {old_pid} será reemplazado", flush=True)
+            pid = await process_control.launch(
+                bundle_id=bundle_id,
+                kill_existing=True,
+                start_suspended=True,
+            )
+    if pid <= 0:
+        raise JITEnableError("DVT no pudo relanzar LiveContainerTV suspendido")
+    print(f"LCTV JIT: lanzamiento suspendido PID {pid}", flush=True)
+    return pid
+
+
+async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str], mode: str) -> None:
+    if mode not in VALID_MODES:
+        raise JITEnableError(f"modo inválido {mode!r}; usa current o launch")
+
     # Hardware-tested workaround for Termux/proot: skip the usbmux/CoreDeviceProxy
     # probe and feed UserspaceRsdTunnel an already-connected RemotePairing service.
     userspace_tunnel._create_no_root_tunnel_provider = _remote_pairing_only
@@ -156,16 +192,13 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str]) -> None:
     reader = None
     writer = None
 
+    print(f"LCTV JIT: modo={mode}", flush=True)
     print("LCTV JIT: abriendo túnel userspace...", flush=True)
     rsd = await tunnel.aopen()
 
     try:
         print(f"LCTV JIT: tvOS {rsd.product_version}", flush=True)
-        pid = await _pid_for_bundle(rsd, bundle_id)
-        if pid <= 0:
-            raise JITEnableError(
-                f"{bundle_id} no está ejecutándose; abre LiveContainerTV en el Apple TV y reintenta"
-            )
+        pid = await _prepare_pid(rsd, bundle_id, mode)
 
         print(f"LCTV JIT: PID {pid}", flush=True)
         debug_port = rsd.get_service_port(DEBUG_SERVICE)
@@ -182,7 +215,7 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str]) -> None:
         if not supported:
             raise JITEnableError("debugserver no respondió qSupported")
 
-        # Optional packets.  Older debugservers may not support one of them.
+        # Optional packets. Older debugservers may not support one of them.
         try:
             await _rsp(reader, writer, "QEnableErrorStrings")
         except Exception:
@@ -202,20 +235,35 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str]) -> None:
         # Give tvOS a moment to commit the runtime debug state before detach.
         await asyncio.sleep(1.0)
 
+        # RSP detach resumes the debuggee. In launch mode this releases the process
+        # that DVT started suspended, allowing application main (and an armed MVP8
+        # guest) to run only after CS_DEBUGGED has been established.
         detach_reply = await _rsp(reader, writer, "D", timeout=15.0)
         if detach_reply != "OK":
             raise JITEnableError(f"detach inesperado: {detach_reply}")
         attached = False
         print("LCTV JIT: DETACH OK", flush=True)
 
+        await asyncio.sleep(0.35)
         pid_after = await _pid_for_bundle(rsd, bundle_id)
-        if pid_after != pid:
-            raise JITEnableError(
-                f"el proceso cambió durante el attach (antes {pid}, después {pid_after}); vuelve a ejecutar lctv jit"
-            )
 
-        print("LCTV JIT: PASS — JIT habilitado para el proceso actual", flush=True)
-        print("LCTV JIT: si la app se reinicia o se reinstala, ejecuta 'lctv jit' otra vez", flush=True)
+        if mode == "current":
+            if pid_after != pid:
+                raise JITEnableError(
+                    f"el proceso cambió durante el attach (antes {pid}, después {pid_after}); vuelve a ejecutar lctv jit"
+                )
+            print("LCTV JIT: PASS — JIT habilitado para el proceso actual", flush=True)
+            print("LCTV JIT: si la app se reinicia o se reinstala, ejecuta 'lctv jit' otra vez", flush=True)
+        else:
+            if pid_after == pid:
+                print("LCTV JIT: proceso relanzado continúa ejecutándose", flush=True)
+            else:
+                print(
+                    "LCTV JIT: WARN — el proceso salió después del detach; JIT sí se aplicó antes de main. "
+                    "Revisa el trace/crash del guest.",
+                    flush=True,
+                )
+            print("LCTV JIT: PASS — lanzamiento debugged completado", flush=True)
 
     finally:
         if attached and reader is not None and writer is not None:
@@ -234,9 +282,10 @@ async def enable_jit(bundle_id: str, remote_pairing_id: Optional[str]) -> None:
 def main() -> int:
     bundle_id = sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip() else DEFAULT_BUNDLE_ID
     remote_pairing_id = sys.argv[2].strip() if len(sys.argv) > 2 and sys.argv[2].strip() else None
+    mode = sys.argv[3].strip().lower() if len(sys.argv) > 3 and sys.argv[3].strip() else "current"
 
     try:
-        asyncio.run(enable_jit(bundle_id, remote_pairing_id))
+        asyncio.run(enable_jit(bundle_id, remote_pairing_id, mode))
     except KeyboardInterrupt:
         print("LCTV JIT: cancelado", file=sys.stderr)
         return 130
