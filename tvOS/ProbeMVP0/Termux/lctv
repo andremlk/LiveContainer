@@ -34,6 +34,7 @@ Uso:
   lctv install [LiveContainerTV.ipa]
   lctv add-install <guest.ipa> [salida.ipa]
   lctv jit
+  lctv jit launch
 
 Estado:
   ~/.local/share/livecontainertv/current.ipa
@@ -56,8 +57,9 @@ Variables para 'jit':
   LCTV_PYMOBILE_PYTHON=/opt/lctv-pymobile/bin/python
   LCTV_REMOTE_PAIRING_ID=<remote-pairing-id>  # opcional si solo hay un Apple TV emparejado
 
-'jit' habilita el estado debug/JIT del proceso LiveContainerTV que ya está
-abierto. Si la app se reinicia o se reinstala, hay que ejecutar 'lctv jit' otra vez.
+'lctv jit' habilita JIT en el proceso que ya está abierto.
+'lctv jit launch' mata/reabre LiveContainerTV suspendido, hace attach antes de
+main y después lo suelta. Este es el modo para arrancar un guest armado en MVP8.
 EOF
 }
 
@@ -325,8 +327,19 @@ plumesign sign-rsd \
 }
 
 cmd_jit() {
-  [ "$#" -eq 0 ] || { usage; return 2; }
+  [ "$#" -le 1 ] || { usage; return 2; }
   need proot-distro
+
+  local mode distro pymobile_python bundle remote_id helper
+  mode="${1:-current}"
+  case "$mode" in
+    current|'') mode='current' ;;
+    launch) ;;
+    *)
+      echo "ERROR: modo JIT desconocido: $mode (usa: lctv jit [launch])" >&2
+      return 2
+      ;;
+  esac
 
   local distro pymobile_python bundle remote_id helper
   distro="${LCTV_PROOT_DISTRO:-atvloadly}"
@@ -355,7 +368,7 @@ cmd_jit() {
     XDG_CACHE_HOME=/root/.cache \
     TMPDIR=/tmp \
     PYTHONUNBUFFERED=1 \
-    "$pymobile_python" - "$bundle" "$remote_id" < "$helper"
+    "$pymobile_python" - "$bundle" "$remote_id" "$mode" < "$helper"
 }
 
 cmd="${1:-}"
