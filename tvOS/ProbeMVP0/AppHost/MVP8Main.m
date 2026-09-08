@@ -24,13 +24,12 @@ static BOOL LCTVMVP8IsDebugged(void) {
     return (flags & CS_DEBUGGED) != 0;
 }
 
-// MVP8C diagnostic layer -----------------------------------------------------
-// MVP8B proved that Infuse no longer fails immediately in dlopen(): dyld adds
-// ~150 images, then the main thread remains inside dlopen for 20+ seconds.
-// MVP8C keeps that watchdog and also samples the blocked main thread's arm64
-// stack from a utility thread.  This lets us distinguish a dyld/initializer
-// wait from a guest-framework constructor without modifying the frozen MVP7H
-// loader itself.
+// MVP8D diagnostic layer -----------------------------------------------------
+// MVP8C proved that the main thread is blocked in __ulock_wait -> libdispatch
+// with UIKitCore as the first visible non-dispatch caller while dlopen remains
+// stuck. MVP8D keeps that sample and, at 20s, scans the other process threads
+// to find the likely initializer/queue owner instead of assuming UIKitCore or
+// the last dyld-added image is the root cause.
 static _Atomic(uint64_t) LCTVMVP8DyldGeneration = 0;
 static _Atomic(uintptr_t) LCTVMVP8LastDyldHeader = 0;
 static dispatch_once_t LCTVMVP8DyldRegistrationOnce;
@@ -114,6 +113,13 @@ static LCTVMVP8StackSample LCTVMVP8SampleThread(thread_t thread) {
     return sample;
 }
 
+static NSString *LCTVMVP8ImagePathForAddress(uint64_t address) {
+    if (!address) return nil;
+    Dl_info info = {0};
+    if (dladdr((const void *)(uintptr_t)address, &info) == 0 || !info.dli_fname) return nil;
+    return [NSString stringWithUTF8String:info.dli_fname];
+}
+
 static NSString *LCTVMVP8CompactAddress(uint64_t address) {
     if (!address) return @"0x0";
     Dl_info info = {0};
@@ -129,6 +135,16 @@ static NSString *LCTVMVP8CompactAddress(uint64_t address) {
     return [NSString stringWithFormat:@"%@!%@+0x%llx", leaf, symbol, (unsigned long long)offset];
 }
 
+static uint64_t LCTVMVP8ThreadID(thread_t thread) {
+    thread_identifier_info_data_t info = {0};
+    mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
+    kern_return_t kr = thread_info(thread,
+                                   THREAD_IDENTIFIER_INFO,
+                                   (thread_info_t)&info,
+                                   &count);
+    return kr == KERN_SUCCESS ? info.thread_id : 0;
+}
+
 static void LCTVMVP8TraceMainThreadSample(thread_t mainThread, unsigned seconds) {
     LCTVMVP8StackSample sample = LCTVMVP8SampleThread(mainThread);
     LCTVMVP8TraceEvent([NSString stringWithFormat:@"DLOPEN_MAIN_STACK t=%us frames=%u suspendKR=%d stateKR=%d",
@@ -142,6 +158,117 @@ static void LCTVMVP8TraceMainThreadSample(thread_t mainThread, unsigned seconds)
                             seconds,
                             i,
                             LCTVMVP8CompactAddress(sample.addresses[i])]);
+    }
+}
+
+static NSInteger LCTVMVP8ScoreThreadSample(LCTVMVP8StackSample sample,
+                                           thread_basic_info_data_t basic) {
+    NSInteger score = 0;
+    if (basic.run_state == TH_STATE_RUNNING) score += 40;
+    else if (basic.run_state == TH_STATE_WAITING) score += 5;
+    score += MIN((NSInteger)(basic.cpu_usage / 10), 30);
+
+    for (uint32_t i = 0; i < sample.count; i++) {
+        NSString *path = LCTVMVP8ImagePathForAddress(sample.addresses[i]);
+        if (!path.length) continue;
+        NSString *lower = path.lowercaseString;
+        if ([lower containsString:@"com.firecore.infuse.code.framework"]) score += 180;
+        else if ([lower containsString:@"infuse"]) score += 140;
+        else if ([lower containsString:@"uikitcore"]) score += 80;
+        else if ([lower containsString:@"foundation.framework"] ||
+                 [lower containsString:@"corefoundation.framework"]) score += 45;
+    }
+
+    NSString *top = sample.count ? LCTVMVP8CompactAddress(sample.addresses[0]) : @"";
+    if ([top containsString:@"__ulock_wait"] ||
+        [top containsString:@"mach_msg"] ||
+        [top containsString:@"semaphore_wait"]) {
+        score -= 20;
+    }
+    return score;
+}
+
+static void LCTVMVP8TraceOtherThreads(thread_t mainThread, unsigned seconds) {
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t threadCount = 0;
+    kern_return_t taskKR = task_threads(mach_task_self(), &threads, &threadCount);
+    if (taskKR != KERN_SUCCESS || !threads) {
+        LCTVMVP8TraceEvent([NSString stringWithFormat:@"THREAD_SCAN t=%us task_threads_KR=%d",
+                            seconds, taskKR]);
+        return;
+    }
+
+    thread_t samplerThread = mach_thread_self();
+    uint64_t samplerID = LCTVMVP8ThreadID(samplerThread);
+    uint64_t mainID = LCTVMVP8ThreadID(mainThread);
+    NSMutableArray<NSDictionary *> *candidates = [NSMutableArray array];
+
+    for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+        thread_t thread = threads[i];
+        uint64_t tid = LCTVMVP8ThreadID(thread);
+        if ((samplerID && tid == samplerID) || (mainID && tid == mainID)) continue;
+
+        thread_basic_info_data_t basic = {0};
+        mach_msg_type_number_t basicCount = THREAD_BASIC_INFO_COUNT;
+        kern_return_t basicKR = thread_info(thread,
+                                            THREAD_BASIC_INFO,
+                                            (thread_info_t)&basic,
+                                            &basicCount);
+        if (basicKR != KERN_SUCCESS) continue;
+
+        LCTVMVP8StackSample sample = LCTVMVP8SampleThread(thread);
+        if (sample.stateKR != KERN_SUCCESS || sample.count == 0) continue;
+
+        NSInteger score = LCTVMVP8ScoreThreadSample(sample, basic);
+        NSMutableArray<NSString *> *frames = [NSMutableArray array];
+        uint32_t frameLimit = sample.count < 3 ? sample.count : 3;
+        for (uint32_t f = 0; f < frameLimit; f++) {
+            [frames addObject:LCTVMVP8CompactAddress(sample.addresses[f])];
+        }
+        NSString *chain = [frames componentsJoinedByString:@" <- "];
+        [candidates addObject:@{
+            @"score": @(score),
+            @"tid": @(tid),
+            @"state": @(basic.run_state),
+            @"cpu": @(basic.cpu_usage),
+            @"chain": chain ?: @"?",
+        }];
+    }
+
+    for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(),
+                  (vm_address_t)threads,
+                  (vm_size_t)(threadCount * sizeof(thread_t)));
+    mach_port_deallocate(mach_task_self(), samplerThread);
+
+    [candidates sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSInteger sa = [a[@"score"] integerValue];
+        NSInteger sb = [b[@"score"] integerValue];
+        if (sa > sb) return NSOrderedAscending;
+        if (sa < sb) return NSOrderedDescending;
+        NSInteger ca = [a[@"cpu"] integerValue];
+        NSInteger cb = [b[@"cpu"] integerValue];
+        if (ca > cb) return NSOrderedAscending;
+        if (ca < cb) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    LCTVMVP8TraceEvent([NSString stringWithFormat:@"THREAD_SCAN t=%us threads=%u candidates=%lu",
+                        seconds,
+                        threadCount,
+                        (unsigned long)candidates.count]);
+    NSUInteger limit = MIN((NSUInteger)4, candidates.count);
+    for (NSUInteger i = 0; i < limit; i++) {
+        NSDictionary *candidate = candidates[i];
+        LCTVMVP8TraceEvent([NSString stringWithFormat:@"THREAD_CAND #%lu tid=%llu state=%ld cpu=%ld score=%ld %@",
+                            (unsigned long)i,
+                            [candidate[@"tid"] unsignedLongLongValue],
+                            (long)[candidate[@"state"] integerValue],
+                            (long)[candidate[@"cpu"] integerValue],
+                            (long)[candidate[@"score"] integerValue],
+                            candidate[@"chain"]]);
     }
 }
 
@@ -181,6 +308,7 @@ static void *LCTVMVP8Dlopen(const char *path, int mode) {
                                         now,
                                         lastImage]);
                     LCTVMVP8TraceMainThreadSample(mainThread, now);
+                    if (now == 20) LCTVMVP8TraceOtherThreads(mainThread, now);
                 }
             });
         }
