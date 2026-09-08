@@ -72,7 +72,7 @@ static NSString *LCTVMVP8PanelText(void) {
     NSUInteger start = history.count > 8 ? history.count - 8 : 0;
     NSArray<NSString *> *tail = [history subarrayWithRange:NSMakeRange(start, history.count - start)];
     NSString *body = tail.count ? [tail componentsJoinedByString:@"\n"] : @"No trace events yet.";
-    return [NSString stringWithFormat:@"MVP8 ENTRY TRACE\n%@", body];
+    return [NSString stringWithFormat:@"MVP8F NOLOCK TRACE\n%@", body];
 }
 
 static void LCTVMVP8RefreshPanel(UIViewController *root) {
@@ -117,7 +117,7 @@ static void LCTVMVP8InstallPanelIfNeeded(void) {
 
     UIButton *clear = [UIButton buttonWithType:UIButtonTypeSystem];
     clear.translatesAutoresizingMaskIntoConstraints = NO;
-    [clear setTitle:@"Clear MVP8 trace" forState:UIControlStateNormal];
+    [clear setTitle:@"Clear MVP8F trace" forState:UIControlStateNormal];
     __weak UIViewController *weakRoot = root;
     [clear addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
         (void)action;

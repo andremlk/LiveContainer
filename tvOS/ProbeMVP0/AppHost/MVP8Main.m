@@ -7,6 +7,7 @@
 #import <stdatomic.h>
 #import <sys/types.h>
 #import <unistd.h>
+#import "MVP8DyldNoLock.h"
 #import "MVP8Trace.h"
 
 #ifndef CS_OPS_STATUS
@@ -24,12 +25,11 @@ static BOOL LCTVMVP8IsDebugged(void) {
     return (flags & CS_DEBUGGED) != 0;
 }
 
-// MVP8E diagnostic layer -----------------------------------------------------
-// MVP8D showed that the main thread waits in __ulock_wait -> libdispatch ->
-// UIKitCore while all sampled worker threads are idle. One secondary thread is
-// itself waiting in __ulock_wait2 with dyld on its stack. MVP8E deepens both
-// sides of that possible circular wait and keeps the 20-second evidence compact
-// enough to remain visible after the host is force-closed and reopened.
+// MVP8F correction + diagnostic fallback ------------------------------------
+// MVP8E confirmed a cycle: main waits in UIKitCore/libdispatch while a
+// BoardServices worker reaches dyld during Objective-C class creation and waits
+// for the dyld API lock held by main's dlopen. MVP8F keeps the sampler as a
+// fallback and loads the guest through a temporary, thread-scoped no-lock path.
 static _Atomic(uint64_t) LCTVMVP8DyldGeneration = 0;
 static _Atomic(uintptr_t) LCTVMVP8LastDyldHeader = 0;
 static dispatch_once_t LCTVMVP8DyldRegistrationOnce;
@@ -330,8 +330,23 @@ static void *LCTVMVP8Dlopen(const char *path, int mode) {
             });
         }
 
-        void *handle = dlopen(path, mode);
+        int noLockMode = RTLD_LAZY | RTLD_GLOBAL | RTLD_FIRST;
+        LCTVMVP8TraceEvent([NSString stringWithFormat:@"MVP8F_NOLOCK_BEGIN target=%@ requestedMode=0x%x effectiveMode=0x%x",
+                            guestName,
+                            mode,
+                            noLockMode]);
+        NSString *noLockError = nil;
+        void *handle = LCTVMVP8FDlopenNoLock(path, noLockMode, &noLockError);
         if (finished) atomic_store_explicit(finished, true, memory_order_release);
+
+        if (noLockError.length) {
+            LCTVMVP8TraceEvent([NSString stringWithFormat:@"MVP8F_NOLOCK_ERROR target=%@ %@",
+                                guestName,
+                                noLockError]);
+        } else {
+            LCTVMVP8TraceEvent([NSString stringWithFormat:@"MVP8F_NOLOCK_RESTORED target=%@",
+                                guestName]);
+        }
 
         LCTVMVP8TraceEvent([NSString stringWithFormat:@"DLOPEN_RETURN %@ target=%@ imagesAdded=%llu",
                             handle ? @"OK" : @"NULL",

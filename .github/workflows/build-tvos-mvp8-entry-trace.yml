@@ -1,4 +1,4 @@
-name: MVP8E Deep Deadlock Pair Sampler
+name: MVP8F Thread-Scoped Dyld NoLock
 
 on:
   workflow_dispatch:
@@ -7,6 +7,8 @@ on:
     paths:
       - 'tvOS/ProbeMVP0/AppHost/MVP7HMain.m'
       - 'tvOS/ProbeMVP0/AppHost/MVP8Main.m'
+      - 'tvOS/ProbeMVP0/AppHost/MVP8DyldNoLock.h'
+      - 'tvOS/ProbeMVP0/AppHost/MVP8DyldNoLock.m'
       - 'tvOS/ProbeMVP0/AppHost/MVP8Trace.h'
       - 'tvOS/ProbeMVP0/AppHost/MVP8Trace.m'
       - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
@@ -24,6 +26,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -51,7 +55,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build | tee out-mvp8/xcodebuild.log
 
-      - name: Verify MVP8E trace binary
+      - name: Verify MVP8F no-lock binary
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
@@ -61,17 +65,19 @@ jobs:
           test -f "$BIN"
           file "$BIN"
           lipo -info "$BIN" | tee out-mvp8/lipo.txt
-          nm "$BIN" | grep -E 'LCTVMVP8TraceEvent|LCTVMVP7HOriginalMain|LCTVMVP8Dlopen' | tee out-mvp8/trace-symbols.txt
-          grep -F 'DLOPEN_HANG' AppHost/MVP8Main.m
-          grep -F 'DEADLOCK_MAIN' AppHost/MVP8Main.m
-          grep -F 'DEADLOCK_SCAN' AppHost/MVP8Main.m
-          grep -F 'DEADLOCK_PEER' AppHost/MVP8Main.m
+          nm "$BIN" | grep -E 'LCTVMVP8TraceEvent|LCTVMVP7HOriginalMain|LCTVMVP8Dlopen|LCTVMVP8FDlopenNoLock|litehook_find_dsc_symbol' | tee out-mvp8/trace-symbols.txt
+          grep -F 'MVP8F_NOLOCK_BEGIN' AppHost/MVP8Main.m
+          grep -F 'MVP8F_NOLOCK_RESTORED' AppHost/MVP8Main.m
+          grep -F 'MVP8F_NOLOCK_ERROR' AppHost/MVP8Main.m
+          grep -F 'LCTVMVP8FLockHook' AppHost/MVP8DyldNoLock.m
+          grep -F 'LCTVMVP8FUnlockHook' AppHost/MVP8DyldNoLock.m
+          grep -F 'RTLD_LAZY | RTLD_GLOBAL | RTLD_FIRST' AppHost/MVP8Main.m
           grep -F 'DLOPEN_RETURN' AppHost/MVP8Main.m
           grep -F 'LEGACY_STAGE:' AppHost/MVP8Trace.m
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee out-mvp8/bundle-id.txt
           /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" | tee out-mvp8/executable.txt
 
-      - name: Package MVP8E host template IPA
+      - name: Package MVP8F host template IPA
         working-directory: tvOS/ProbeMVP0
         run: |
           set -euo pipefail
@@ -80,15 +86,15 @@ jobs:
           rm -rf out-mvp8/package
           mkdir -p "$PKG"
           cp -R "$APP" "$PKG/"
-          (cd out-mvp8/package && zip -qry ../LiveContainerTV-MVP8E-DeepDeadlockSampler.ipa Payload)
-          shasum -a 256 out-mvp8/LiveContainerTV-MVP8E-DeepDeadlockSampler.ipa | tee out-mvp8/SHA256.txt
+          (cd out-mvp8/package && zip -qry ../LiveContainerTV-MVP8F-DyldNoLock.ipa Payload)
+          shasum -a 256 out-mvp8/LiveContainerTV-MVP8F-DyldNoLock.ipa | tee out-mvp8/SHA256.txt
 
-      - name: Upload MVP8E host IPA
+      - name: Upload MVP8F host IPA
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainerTV-MVP8E-DeepDeadlockSampler
+          name: LiveContainerTV-MVP8F-DyldNoLock
           path: |
-            tvOS/ProbeMVP0/out-mvp8/LiveContainerTV-MVP8E-DeepDeadlockSampler.ipa
+            tvOS/ProbeMVP0/out-mvp8/LiveContainerTV-MVP8F-DyldNoLock.ipa
             tvOS/ProbeMVP0/out-mvp8/SHA256.txt
             tvOS/ProbeMVP0/out-mvp8/xcodebuild.log
             tvOS/ProbeMVP0/out-mvp8/trace-symbols.txt

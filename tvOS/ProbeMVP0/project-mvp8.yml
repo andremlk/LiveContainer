@@ -20,12 +20,18 @@ targets:
     sources:
       - path: AppHost/GuestRuntime.m
       - path: AppHost/MVP8Main.m
+      - path: AppHost/MVP8DyldNoLock.m
       - path: AppHost/MVP8Trace.m
+      - path: ../../litehook/src/litehook.c
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.livecontainertv.probe
         PRODUCT_NAME: LiveContainerTV
         INFOPLIST_FILE: AppHost/Info.plist
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../../litehook/src"
+          - "$(SRCROOT)/../../litehook/external/include"
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"
           - "@executable_path/Frameworks"

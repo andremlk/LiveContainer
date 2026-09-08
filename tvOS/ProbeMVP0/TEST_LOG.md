@@ -451,3 +451,60 @@ DO NOT REPEAT:
 - treating the MVP8C main-thread stack as proof of a simple dyld mapping hang
 - treating UIKitCore frame #4 as definitive root cause without inspecting other threads
 - repeating MVP8C unchanged; the next useful probe is cross-thread sampling during the blocked `dlopen()`
+
+### MVP8E — hardware deep deadlock result and confirmed cause
+
+MVP8E was installed with Infuse 8.5.1 and launched through `lctv jit launch` on AppleTV14,1 / tvOS 18.6.
+
+Observed after 20 seconds:
+
+- `DLOPEN_HANG t=20s imagesAdded=150 last=BackgroundTasks.framework/BackgroundTasks`
+- main thread: `__ulock_wait -> libdispatch -> UIKitCore -> libobjc`
+- highest-scored peer: `__ulock_wait2 -> libsystem_platform -> dyld -> libobjc.A.dylib!imp_implementationWithBlock -> BoardServices!_BSObjCClassCreate -> UIKitServices`
+- another peer: `__ulock_wait2 -> libsystem_platform -> BoardServices -> libxpc -> libdispatch`
+
+Confirmed deadlock pattern:
+
+1. the main thread calls guest `dlopen()` and dyld holds its outer recursive API lock while running image initializers / Objective-C load work;
+2. UIKit startup synchronously waits for BoardServices/UIKitServices work;
+3. the BoardServices worker creates or installs Objective-C classes and re-enters dyld;
+4. that worker blocks on the dyld API lock held by the main thread;
+5. the main thread cannot finish its UIKit wait until the worker proceeds, producing the persistent black screen.
+
+`BackgroundTasks.framework` was only the last image reported by the add-image callback. It was not the cause.
+
+Conclusion: MVP8E completed the diagnosis. Repeating the deep sampler unchanged has no value.
+
+### MVP8F — solution implemented: thread-scoped dyld no-lock load
+
+Solution selected from the current upstream LiveContainer black-screen fix and adapted to this standalone tvOS host:
+
+- locate `dyld4::LibSystemHelpers` and its recursive lock/unlock methods in the dyld shared cache through the pinned `litehook` submodule;
+- temporarily replace only the two corresponding libdyld vtable slots;
+- identify the guest-loading thread and bypass only the first matching dyld recursive API lock on that thread;
+- preserve the real lock behavior for every other thread and for every unrelated lock;
+- call the transformed guest with `RTLD_LAZY | RTLD_GLOBAL | RTLD_FIRST`;
+- restore the original vtable entries immediately after `dlopen()` returns, before tracing or continuing to `LC_MAIN`;
+- keep the MVP8E watchdog and stack sampler as fallback evidence if a different wait remains;
+- refuse to fall back to the known-deadlocking raw `dlopen()` if symbol lookup or vtable protection fails.
+
+Safety details:
+
+- no Foundation/Objective-C logging occurs between vtable patching and `dlopen()`;
+- installation is serialized with an atomic guard;
+- shared-cache page writes use the direct Mach protection wrapper and TPRO fallback already used by LiveContainer;
+- the target Mach thread right is released and all temporary global state is cleared after restoration;
+- the signed code-slot, writable resource split, guest identity virtualization, stable outer bundle ID, and real `LC_MAIN` path remain unchanged.
+
+Expected hardware trace for the first MVP8F run:
+
+`MVP8F_NOLOCK_BEGIN -> MVP8F_NOLOCK_RESTORED -> DLOPEN_RETURN OK`
+
+After `DLOPEN_RETURN OK`, the loader should locate the transformed image's `LC_MAIN`, finish guest identity setup, and enter Infuse's real main function. Hardware validation is pending.
+
+DO NOT REPEAT:
+
+- raw `dlopen(RTLD_NOW | RTLD_GLOBAL)` for this Infuse path;
+- moving guest `dlopen()` to a worker thread as a substitute for breaking the proven dyld/UIKit/BoardServices cycle;
+- leaving the libdyld vtable patched after guest `dlopen()` returns;
+- bypassing dyld locking globally or for threads other than the single guest-loading thread.
