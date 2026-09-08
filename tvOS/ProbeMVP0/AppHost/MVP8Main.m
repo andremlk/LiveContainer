@@ -1,7 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/arm/thread_status.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -94,16 +93,16 @@ static LCTVMVP8StackSample LCTVMVP8SampleThread(thread_t thread) {
         if (pc) sample.addresses[sample.count++] = pc;
         if (lr && sample.count < 8) sample.addresses[sample.count++] = lr;
 
-        // arm64 frame records are {previous FP, saved LR}.  Read through Mach
-        // rather than dereferencing the other thread's stack directly.
+        // arm64 frame records are {previous FP, saved LR}. tvOS exposes the
+        // classic vm_read_overwrite API (not mach_vm_read_overwrite).
         for (unsigned depth = 0; depth < 6 && fp && sample.count < 8; depth++) {
             LCTVMVP8FrameRecord record = {0};
-            mach_vm_size_t copied = 0;
-            kern_return_t readKR = mach_vm_read_overwrite(mach_task_self(),
-                                                          (mach_vm_address_t)fp,
-                                                          sizeof(record),
-                                                          (mach_vm_address_t)&record,
-                                                          &copied);
+            vm_size_t copied = 0;
+            kern_return_t readKR = vm_read_overwrite(mach_task_self(),
+                                                     (vm_address_t)fp,
+                                                     (vm_size_t)sizeof(record),
+                                                     (vm_address_t)&record,
+                                                     &copied);
             if (readKR != KERN_SUCCESS || copied != sizeof(record)) break;
             if (record.returnPC) sample.addresses[sample.count++] = record.returnPC;
             if (!record.previousFP || record.previousFP <= fp || record.previousFP - fp > (1ULL << 20)) break;
@@ -137,8 +136,6 @@ static void LCTVMVP8TraceMainThreadSample(thread_t mainThread, unsigned seconds)
                         sample.count,
                         sample.suspendKR,
                         sample.stateKR]);
-    // Five frames are enough to retain the blocking site plus its callers while
-    // keeping the persistent panel readable after the host is reopened.
     uint32_t limit = sample.count < 5 ? sample.count : 5;
     for (uint32_t i = 0; i < limit; i++) {
         LCTVMVP8TraceEvent([NSString stringWithFormat:@"STACK t=%us #%u %@",
@@ -199,8 +196,6 @@ static void *LCTVMVP8Dlopen(const char *path, int mode) {
     }
 }
 
-// Compile the proven MVP7H loader unchanged, but rename its process entry point
-// and route only its dlopen() call through the MVP8C diagnostic wrapper.
 #define dlopen LCTVMVP8Dlopen
 #define main LCTVMVP7HOriginalMain
 #include "MVP7HMain.m"
