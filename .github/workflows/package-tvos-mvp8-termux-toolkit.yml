@@ -1,0 +1,97 @@
+name: MVP8 Termux JIT Toolkit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp8-entry-trace]
+    paths:
+      - 'tvOS/ProbeMVP0/Termux/**'
+      - 'tvOS/ProbeMVP0/Tools/lctv_jit_enable.py'
+      - '.github/workflows/package-tvos-mvp8-termux-toolkit.yml'
+
+concurrency:
+  group: tvos-mvp8-termux-toolkit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static checks
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          bash -n Termux/lctv
+          bash -n Termux/lctv-rebase
+          python3 -m py_compile Tools/lctv_jit_enable.py
+          grep -F 'lctv jit' Termux/lctv
+          grep -F 'dev.andre.livecontainertv.mvp3' Tools/lctv_jit_enable.py
+          grep -F 'com.apple.internal.dt.remote.debugproxy' Tools/lctv_jit_enable.py
+          grep -F 'vAttach;' Tools/lctv_jit_enable.py
+          grep -F 'LCTV JIT: PASS' Tools/lctv_jit_enable.py
+
+      - name: Package toolkit
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          KIT='out/mvp8-toolkit/LiveContainerTV-Termux'
+          rm -rf out/mvp8-toolkit
+          mkdir -p "$KIT/bin" "$KIT/Tools"
+
+          cp Termux/lctv "$KIT/bin/lctv"
+          cp Termux/lctv-rebase "$KIT/bin/lctv-rebase"
+          cp Termux/termux.conf.example "$KIT/termux.conf.example"
+
+          cp Tools/lctv_jit_enable.py "$KIT/Tools/"
+          cp Tools/lctv_macho_patch.py "$KIT/Tools/"
+          cp Tools/lctv_registry_from_host.py "$KIT/Tools/"
+          cp Tools/lctv_ipa_analyze.py "$KIT/Tools/"
+          cp Tools/lctv_prepare_ipa.sh "$KIT/Tools/"
+          cp Tools/lctv_split_guest.py "$KIT/Tools/"
+          cp Tools/lctv_import_guest.py "$KIT/Tools/"
+          cp Tools/lctv_assemble_update.py "$KIT/Tools/"
+          cp Tools/verify_macho.py "$KIT/Tools/"
+
+          chmod +x "$KIT/bin/lctv" "$KIT/bin/lctv-rebase" "$KIT/Tools/lctv_jit_enable.py"
+          bash -n "$KIT/bin/lctv"
+          python3 -m py_compile "$KIT/Tools/lctv_jit_enable.py"
+
+          cat > "$KIT/README.txt" <<'EOF'
+          LiveContainerTV MVP8 Termux JIT toolkit
+
+          Existing Termux dependencies:
+            pkg install python zip unzip dnsutils proot-distro
+
+          JIT dependency inside the atvloadly proot:
+            /opt/lctv-pymobile/bin/python with pymobiledevice3 installed
+
+          Outer bundle identity:
+            dev.andre.livecontainertv.mvp3
+
+          One-command JIT flow:
+            1. Open LiveContainerTV on Apple TV.
+            2. Run: bin/lctv jit
+            3. Expect: LCTV JIT: PASS — JIT habilitado para el proceso actual
+
+          `lctv jit` uses the saved RemotePairing record directly, creates a no-root
+          userspace RSD tunnel, resolves the running host PID with DVT, attaches through
+          com.apple.internal.dt.remote.debugproxy, then cleanly detaches. The process must
+          stay alive; after an app restart/reinstall run `lctv jit` again.
+
+          If more than one Apple TV is paired, set LCTV_REMOTE_PAIRING_ID in:
+            ~/.config/livecontainertv/termux.conf
+          EOF
+
+          (cd out/mvp8-toolkit && zip -qry ../MVP8-Termux-JIT-Toolkit.zip LiveContainerTV-Termux)
+          sha256sum out/MVP8-Termux-JIT-Toolkit.zip | tee out/MVP8-Termux-JIT-Toolkit-SHA256.txt
+
+      - name: Upload toolkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: MVP8-Termux-JIT-Toolkit
+          path: |
+            tvOS/ProbeMVP0/out/MVP8-Termux-JIT-Toolkit.zip
+            tvOS/ProbeMVP0/out/MVP8-Termux-JIT-Toolkit-SHA256.txt
+          if-no-files-found: error
