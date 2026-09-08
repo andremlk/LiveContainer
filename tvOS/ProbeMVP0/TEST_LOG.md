@@ -574,3 +574,48 @@ Hardware environment confirmed before adding the recovery:
 Hardware validation of `lctv jit repair` is pending.  Do not classify the DDI
 mount as the final solution until `REPAIR PASS` and a subsequent pre-main
 `ATTACH OK` are both observed.
+
+### MVP8F — developer-image repair attempt 1: Apple TV needs Cryptex1
+
+The first hardware execution of `lctv jit repair` remained application-safe but
+failed while selecting a personalized DDI build identity:
+
+`no se pudo montar la imagen de desarrollo: KeyError: 'ApBoardID'`
+
+Observed guarantees:
+
+- RemotePairing/RSD and tvOS 18.6 discovery — PASS;
+- debugproxy was confirmed absent;
+- no application launch, suspend, attach, kill, or guest execution occurred;
+- command exited non-zero without requiring another Apple TV reboot.
+
+The cached `27A5228h` DDI `BuildManifest.plist` was inspected on the Termux
+proot.  It contains 141 build identities:
+
+- 140 traditional identities contain `ApBoardID` and `ApChipID`;
+- none of those 140 identifies the Apple TV hardware family;
+- the remaining identity intentionally has no AP board/chip pair;
+- that last identity declares `Cryptex1,UseProductClass` and the other
+  `Cryptex1,*` installation fields.
+
+Root cause:
+
+- pymobiledevice3's generic `auto_mount()` path iterates identities using direct
+  `tmp_build_identity["ApBoardID"]` / `["ApChipID"]` indexing;
+- because AppleTV14,1 has no traditional identity match, iteration reaches the
+  universal Cryptex identity and raises `KeyError`;
+- merely skipping the incomplete identity would still leave Apple TV without a
+  compatible board/chip identity, so it is not a complete fix.
+
+Recovery correction:
+
+- Apple TV now uses `CryptexdService.auto_install_ddi()` directly;
+- this consumes the universal `Cryptex1,UseProductClass` identity and obtains
+  the larger personalization identifier set from cryptexd;
+- non-Apple product families retain the normal image-mounter path, with a
+  narrowly scoped Cryptex fallback only for identity-selection failures;
+- transport/TSS/device errors are not hidden by the fallback;
+- after installation, repair still closes the old tunnel and requires
+  debugproxy to appear in a fresh RSD catalog before reporting `REPAIR PASS`.
+
+Hardware validation of the Cryptex1 correction is pending.

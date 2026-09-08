@@ -28,9 +28,10 @@ import asyncio
 import sys
 from typing import Optional
 
-from pymobiledevice3.exceptions import AlreadyMountedError
+from pymobiledevice3.exceptions import AlreadyMountedError, NoSuchBuildIdentityError
 from pymobiledevice3.remote import userspace_tunnel
 from pymobiledevice3.remote.tunnel_service import get_remote_pairing_tunnel_services
+from pymobiledevice3.services.cryptexd import CryptexdService
 from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
 from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
 from pymobiledevice3.services.mobile_image_mounter import auto_mount
@@ -194,6 +195,39 @@ def _debug_port(rsd) -> int:
         raise JITEnableError("debugproxy no está disponible") from exc
 
 
+async def _activate_developer_image(rsd) -> str:
+    """Install/mount the DDI through the path supported by this device."""
+    product_type = str(getattr(rsd, "product_type", ""))
+
+    # The current personalized DDI has 140 board/chip identities for iPhone and
+    # iPad plus one universal Cryptex1,UseProductClass identity. AppleTV14,1 is
+    # intentionally absent from the former, so mobile_image_mounter cannot
+    # select a board identity. cryptexd is the correct ProductClass-aware path.
+    if product_type.startswith("AppleTV"):
+        print(
+            f"LCTV JIT: {product_type} requiere DDI Cryptex1/UseProductClass",
+            flush=True,
+        )
+        installed = await CryptexdService(rsd).auto_install_ddi()
+        return f"cryptex {installed.identifier} {installed.version} instalado"
+
+    try:
+        await auto_mount(rsd)
+        return "imagen de desarrollo montada"
+    except (KeyError, NoSuchBuildIdentityError) as exc:
+        # Future non-iOS product families may also be represented only by the
+        # universal Cryptex identity. Limit fallback to manifest-selection
+        # failures; transport, TSS and device errors must remain visible.
+        if isinstance(exc, KeyError) and exc.args not in (("ApBoardID",), ("ApChipID",)):
+            raise
+        print(
+            "LCTV JIT: sin identidad board/chip compatible; usando DDI Cryptex1/UseProductClass",
+            flush=True,
+        )
+        installed = await CryptexdService(rsd).auto_install_ddi()
+        return f"cryptex {installed.identifier} {installed.version} instalado"
+
+
 async def _repair_developer_services(remote_pairing_id: Optional[str]) -> None:
     """Mount the developer image without launching an application."""
     tunnel = _new_tunnel(remote_pairing_id)
@@ -208,9 +242,9 @@ async def _repair_developer_services(remote_pairing_id: Optional[str]) -> None:
         except JITEnableError:
             print("LCTV JIT: debugproxy ausente; montando imagen de desarrollo...", flush=True)
             try:
-                await auto_mount(rsd)
+                activation = await _activate_developer_image(rsd)
                 mount_requested = True
-                print("LCTV JIT: imagen de desarrollo montada", flush=True)
+                print(f"LCTV JIT: {activation}", flush=True)
             except AlreadyMountedError:
                 mount_requested = True
                 print("LCTV JIT: imagen ya figuraba montada; renovando catálogo RSD", flush=True)

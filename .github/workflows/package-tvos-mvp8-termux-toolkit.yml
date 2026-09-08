@@ -35,6 +35,8 @@ jobs:
           grep -F 'SAFE CLEANUP' Tools/lctv_jit_enable.py
           grep -F 'cleanup_process_control.kill(pid)' Tools/lctv_jit_enable.py
           grep -F 'auto_mount(rsd)' Tools/lctv_jit_enable.py
+          grep -F 'CryptexdService(rsd).auto_install_ddi()' Tools/lctv_jit_enable.py
+          grep -F 'Cryptex1/UseProductClass' Tools/lctv_jit_enable.py
           grep -F 'REPAIR PASS' Tools/lctv_jit_enable.py
           grep -F "lctv jit repair" Termux/lctv
           grep -F 'vAttach;' Tools/lctv_jit_enable.py
@@ -180,9 +182,10 @@ jobs:
             3. Expect: LCTV JIT: REPAIR PASS
             4. Run: bin/lctv jit launch
 
-          Repair mode never launches or attaches to an application. It mounts
-          the personalized developer image only when debugproxy is absent and
-          verifies the refreshed service catalog through a new RSD tunnel.
+          Repair mode never launches or attaches to an application. It activates
+          the personalized developer image only when debugproxy is absent, using
+          cryptexd's ProductClass path on Apple TV, and verifies the refreshed
+          service catalog through a new RSD tunnel.
 
           Safety behavior:
             - debugproxy is checked before a suspended launch is created.
