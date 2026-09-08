@@ -416,3 +416,38 @@ MVP8C goal: while `dlopen()` is blocked, sample the main thread stack at watchdo
 - **Treating a successful JIT attach as proof that the guest boot succeeded:** JIT is only the prerequisite; guest loading must be traced separately.
 - **Treating the last dyld-added image as the culprit:** it is correlation only until the blocked thread stack identifies the wait site.
 - **Re-testing the old `InfuseBypass` missing-path failure after the direct dependency rebase fix is verified:** that failure is closed unless a regression reintroduces the old path.
+
+### MVP8C — hardware main-thread stack result
+
+MVP8C was installed with the verified `InfuseBypass` dependency rebase intact and launched with `lctv jit launch`.
+
+JIT launch result:
+
+- suspended pre-main launch — PASS
+- debugserver ATTACH — PASS
+- DETACH — PASS
+- process remained alive after detach
+
+At 20 seconds while `dlopen()` was still blocked, the sampled main-thread stack was:
+
+`#0 libsystem_kernel.dylib!__ulock_wait+0x8`
+`#1 libdispatch.dylib!<redacted>+0x38`
+`#2 libdispatch.dylib!<redacted>+0x94`
+`#3 libdispatch.dylib!<redacted>+0x3c`
+`#4 UIKitCore!<redacted>+0x98`
+
+Interpretation:
+
+- the main thread is not spinning in dyld mapping; it is sleeping in an unfair-lock / ulock wait reached through libdispatch
+- the first non-dispatch caller visible is UIKitCore
+- this strongly points to a synchronous dispatch/once-style initialization wait inside UIKit-related startup while `dlopen()` is running
+- this does **not** prove UIKitCore itself is the root cause; another thread may hold the resource or be executing the initializer the main thread is waiting on
+- the previous `BackgroundTasks.framework` last-image observation remains correlation only
+
+Next diagnostic should sample other process threads during the hang and identify the thread that is running/holding the corresponding initialization path, rather than repeating the same main-thread-only stack capture.
+
+DO NOT REPEAT:
+
+- treating the MVP8C main-thread stack as proof of a simple dyld mapping hang
+- treating UIKitCore frame #4 as definitive root cause without inspecting other threads
+- repeating MVP8C unchanged; the next useful probe is cross-thread sampling during the blocked `dlopen()`
