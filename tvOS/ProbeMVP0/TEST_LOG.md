@@ -319,3 +319,48 @@ When back at the Apple TV:
 ## Logging rule
 
 Every hardware result, regression, architectural conclusion, and workaround discovered from this point forward should be appended to this file in the same change set as the relevant code whenever practical.
+
+## 2026-09-09 — Non-JIT continuation branch
+
+Decision: pause all JIT work temporarily and continue from the last pre-JIT baseline.
+
+Exact pre-JIT baseline commit:
+
+`a14717869b336f65f1c1f85a325ab6dca66b3f29` — `docs(tvOS): add hardware and pipeline test log through MVP7I`
+
+New isolated branch:
+
+`tvos-mvp7i-nonjit`
+
+Rules for this branch:
+
+- no `CS_DEBUGGED` gate
+- no debugger attach requirement
+- no `lctv jit launch` requirement
+- no MVP7J/MVP8 runtime probe or stack-sampler code in the host
+- keep the signed CodeSlot architecture validated in MVP7C–MVP7I
+
+Post-MVP7I importer fix intentionally ported forward because it is independent of JIT:
+
+- direct guest dylib dependencies beginning with `@executable_path` are rebased to `@loader_path`
+- this preserves the verified InfuseBypass fix:
+  `@loader_path/Frameworks/InfuseBypass.framework/InfuseBypass`
+- duplicate `LC_RPATH` avoidance and `SC_Info` stripping remain part of the MVP7I baseline
+
+New host target:
+
+`LiveContainerTV-MVP7I-NonJIT-HostTemplate.ipa`
+
+The target compiles only the proven MVP7H loader plus `GuestRuntime`; it deliberately excludes `MVP7JProbe.m` and all MVP8 diagnostics.
+
+### Next non-JIT hardware test
+
+1. build the clean MVP7I non-JIT host template in CI
+2. import raw `Infuse-8.5.1.ipa` into that template using the current importer with the direct dylib rebase fix
+3. verify the concrete InfuseBypass dependency is still `@loader_path/...`
+4. sign/install over `dev.andre.livecontainertv.mvp3`
+5. open LiveContainerTV normally — no debugger/JIT step
+6. arm/launch Infuse using the ordinary MVP7H flow
+7. record the first runtime result after `dlopen`
+
+This test answers one specific question: with every known path/resource transformation fix retained, how far can Infuse progress under the fully signed non-JIT architecture?
