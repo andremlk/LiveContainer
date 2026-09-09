@@ -3,6 +3,12 @@
 
 This mirrors Tools/lctv_macho_patch.c without depending on Apple's Mach-O
 headers, so it can run under Python 3 on Termux/Linux as well as macOS.
+
+In addition to converting the guest main executable from MH_EXECUTE to MH_DYLIB,
+this patcher rebases direct dylib dependency paths from @executable_path to
+@loader_path. The guest executable lives at the root of its signed code-slot
+framework, with its original Frameworks directory beside it, so @loader_path is
+the correct anchor after import.
 """
 
 import argparse
@@ -16,15 +22,28 @@ MH_DYLIB = 0x6
 MH_NO_REEXPORTED_DYLIBS = 0x00100000
 MH_PIE = 0x00200000
 
-LC_SEGMENT_64 = 0x19
+LC_LOAD_DYLIB = 0xC
 LC_ID_DYLIB = 0xD
 LC_LOAD_DYLINKER = 0xE
+LC_SEGMENT_64 = 0x19
+LC_LOAD_WEAK_DYLIB = 0x80000018
+LC_REEXPORT_DYLIB = 0x8000001F
+LC_LAZY_LOAD_DYLIB = 0x20
+LC_LOAD_UPWARD_DYLIB = 0x80000023
 LC_RPATH = 0x8000001C
 LC_MAIN = 0x80000028
 
 HEADER_SIZE = 32
 SEGMENT64_SIZE = 72
 DYLIB_COMMAND_SIZE = 24
+
+DYLIB_LOAD_COMMANDS = {
+    LC_LOAD_DYLIB,
+    LC_LOAD_WEAK_DYLIB,
+    LC_REEXPORT_DYLIB,
+    LC_LAZY_LOAD_DYLIB,
+    LC_LOAD_UPWARD_DYLIB,
+}
 
 
 class PatchError(RuntimeError):
@@ -43,22 +62,61 @@ def put_u64(data: bytearray, offset: int, value: int) -> None:
     struct.pack_into("<Q", data, offset, value)
 
 
+def patch_command_string_prefix(
+    data: bytearray,
+    command_offset: int,
+    cmdsize: int,
+    string_offset_field: int,
+    old: bytes,
+    new: bytes,
+) -> bool:
+    """Rewrite a load-command string prefix in place without growing cmdsize."""
+    if cmdsize < string_offset_field + 4:
+        raise PatchError("invalid load command string field")
+
+    path_offset = u32(data, command_offset + string_offset_field)
+    if path_offset >= cmdsize:
+        raise PatchError("invalid load command string offset")
+
+    start = command_offset + path_offset
+    end_limit = command_offset + cmdsize
+    nul = data.find(0, start, end_limit)
+    if nul < 0:
+        raise PatchError("unterminated load command string")
+
+    raw = bytes(data[start:nul])
+    if not raw.startswith(old):
+        return False
+
+    replacement = new + raw[len(old):]
+    capacity = end_limit - start
+    if len(replacement) + 1 > capacity:
+        raise PatchError("rebased load-command string does not fit existing command")
+
+    data[start:end_limit] = replacement + b"\0" + b"\0" * (capacity - len(replacement) - 1)
+    return True
+
+
 def patch_rpath(data: bytearray, command_offset: int, cmdsize: int) -> bool:
     if cmdsize < 12:
         raise PatchError("invalid LC_RPATH command")
+
     path_offset = u32(data, command_offset + 8)
     if path_offset >= cmdsize:
         raise PatchError("invalid LC_RPATH string offset")
+
     start = command_offset + path_offset
     end_limit = command_offset + cmdsize
     nul = data.find(0, start, end_limit)
     if nul < 0:
         raise PatchError("unterminated LC_RPATH string")
+
     raw = bytes(data[start:nul])
     old = b"@executable_path"
     new = b"@loader_path"
     if not raw.startswith(old):
         return False
+
     replacement = new + raw[len(old):]
 
     # Some apps already carry both @executable_path/Frameworks and
@@ -73,6 +131,20 @@ def patch_rpath(data: bytearray, command_offset: int, cmdsize: int) -> bool:
         raise PatchError("retargeted LC_RPATH does not fit existing command")
     data[start:end_limit] = replacement + b"\0" + b"\0" * (capacity - len(replacement) - 1)
     return True
+
+
+def patch_dylib_dependency(data: bytearray, command_offset: int, cmdsize: int) -> bool:
+    if cmdsize < DYLIB_COMMAND_SIZE:
+        raise PatchError("invalid dylib load command")
+    # struct dylib_command has the lc_str name offset at +8.
+    return patch_command_string_prefix(
+        data,
+        command_offset,
+        cmdsize,
+        8,
+        b"@executable_path",
+        b"@loader_path",
+    )
 
 
 def patch_bytes(data: bytearray) -> dict:
@@ -96,6 +168,7 @@ def patch_bytes(data: bytearray) -> dict:
     dylinker_size = None
     has_main = False
     rpaths_patched = 0
+    dylib_paths_patched = 0
 
     cursor = HEADER_SIZE
     commands_end = HEADER_SIZE + sizeofcmds
@@ -118,6 +191,9 @@ def patch_bytes(data: bytearray) -> dict:
         elif cmd == LC_RPATH:
             if patch_rpath(data, cursor, cmdsize):
                 rpaths_patched += 1
+        elif cmd in DYLIB_LOAD_COMMANDS:
+            if patch_dylib_dependency(data, cursor, cmdsize):
+                dylib_paths_patched += 1
         cursor += cmdsize
 
     if pagezero_offset is None:
@@ -155,6 +231,7 @@ def patch_bytes(data: bytearray) -> dict:
 
     return {
         "rpathsPatched": rpaths_patched,
+        "dylibPathsPatched": dylib_paths_patched,
         "pagezeroVmaddr": hex(0x100000000 - 0x4000),
         "pagezeroVmsize": hex(0x4000),
     }
@@ -177,7 +254,8 @@ def main() -> int:
     print(
         f"patched {path}: MH_EXECUTE -> MH_DYLIB, __PAGEZERO adjusted, "
         f"LC_ID_DYLIB installed, executable rpaths retargeted "
-        f"(rpaths={report['rpathsPatched']})"
+        f"(rpaths={report['rpathsPatched']}), dylib dependencies rebased "
+        f"(dylibs={report['dylibPathsPatched']})"
     )
     return 0
 
