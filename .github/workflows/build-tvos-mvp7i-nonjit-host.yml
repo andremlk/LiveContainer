@@ -1,0 +1,106 @@
+name: MVP7I Non-JIT Host Template
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [tvos-mvp7i-nonjit]
+    paths:
+      - 'tvOS/ProbeMVP0/AppHost/MVP7HMain.m'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.h'
+      - 'tvOS/ProbeMVP0/AppHost/GuestRuntime.m'
+      - 'tvOS/ProbeMVP0/AppHost/Info.plist'
+      - 'tvOS/ProbeMVP0/Tools/lctv_macho_patch.py'
+      - 'tvOS/ProbeMVP0/project-mvp7i-nonjit.yml'
+      - '.github/workflows/build-tvos-mvp7i-nonjit-host.yml'
+
+concurrency:
+  group: tvos-mvp7i-nonjit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-host-template:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Validate non-JIT importer patcher
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          python3 -m py_compile Tools/lctv_macho_patch.py
+          grep -F 'patch_dylib_dependency' Tools/lctv_macho_patch.py
+          grep -F '@loader_path' Tools/lctv_macho_patch.py
+          grep -F 'duplicate rpaths' Tools/lctv_macho_patch.py
+
+      - name: Generate standalone MVP7I non-JIT project
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project-mvp7i-nonjit.yml
+
+      - name: Build unsigned tvOS host
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          rm -rf build-mvp7i-nonjit out-mvp7i-nonjit
+          mkdir -p out-mvp7i-nonjit
+          xcodebuild \
+            -project LiveContainerTVMVP7INonJIT.xcodeproj \
+            -scheme LiveContainerTVMVP7INonJIT \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build-mvp7i-nonjit \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee out-mvp7i-nonjit/xcodebuild.log
+
+      - name: Verify clean non-JIT host binary
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          APP='build-mvp7i-nonjit/Build/Products/Release-appletvos/LiveContainerTV.app'
+          BIN="$APP/LiveContainerTV"
+          test -d "$APP"
+          test -f "$BIN"
+          file "$BIN"
+          lipo -info "$BIN" | tee out-mvp7i-nonjit/lipo.txt
+          nm "$BIN" | grep -F 'LCTVMVP7H' | head -n 20 | tee out-mvp7i-nonjit/loader-symbols.txt || true
+          if nm -u "$BIN" | grep -Eq '(_csops|csops)$'; then
+            echo 'ERROR: unexpected csops/JIT dependency in non-JIT host'
+            exit 1
+          fi
+          if strings "$BIN" | grep -Fq 'MVP7J JIT'; then
+            echo 'ERROR: MVP7J JIT marker leaked into non-JIT host'
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee out-mvp7i-nonjit/bundle-id.txt
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" | tee out-mvp7i-nonjit/executable.txt
+
+      - name: Package MVP7I non-JIT host template IPA
+        working-directory: tvOS/ProbeMVP0
+        run: |
+          set -euo pipefail
+          APP='build-mvp7i-nonjit/Build/Products/Release-appletvos/LiveContainerTV.app'
+          PKG='out-mvp7i-nonjit/package/Payload'
+          rm -rf out-mvp7i-nonjit/package
+          mkdir -p "$PKG"
+          cp -R "$APP" "$PKG/"
+          (cd out-mvp7i-nonjit/package && zip -qry ../LiveContainerTV-MVP7I-NonJIT-HostTemplate.ipa Payload)
+          shasum -a 256 out-mvp7i-nonjit/LiveContainerTV-MVP7I-NonJIT-HostTemplate.ipa | tee out-mvp7i-nonjit/SHA256.txt
+
+      - name: Upload MVP7I non-JIT host IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainerTV-MVP7I-NonJIT-HostTemplate
+          path: |
+            tvOS/ProbeMVP0/out-mvp7i-nonjit/LiveContainerTV-MVP7I-NonJIT-HostTemplate.ipa
+            tvOS/ProbeMVP0/out-mvp7i-nonjit/SHA256.txt
+            tvOS/ProbeMVP0/out-mvp7i-nonjit/xcodebuild.log
+            tvOS/ProbeMVP0/out-mvp7i-nonjit/lipo.txt
+            tvOS/ProbeMVP0/out-mvp7i-nonjit/bundle-id.txt
+            tvOS/ProbeMVP0/out-mvp7i-nonjit/executable.txt
+          if-no-files-found: error
